@@ -390,10 +390,30 @@ pub mod usb {
                     })
                 })
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "USB device not found"))?;
+            let configuration = device
+                .active_config_descriptor()
+                .or_else(|_| device.config_descriptor(0))
+                .map_err(io::Error::other)?;
+            let packet_size = configuration
+                .interfaces()
+                .flat_map(|candidate| candidate.descriptors())
+                .filter(|descriptor| descriptor.interface_number() == interface)
+                .flat_map(|descriptor| descriptor.endpoint_descriptors())
+                .find(|endpoint| endpoint.address() == out)
+                .map(|endpoint| usize::from(endpoint.max_packet_size()))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "USB bulk OUT endpoint not found")
+                })?;
             let handle = device.open().map_err(io::Error::other)?;
             let _ = handle.set_auto_detach_kernel_driver(true);
             handle
+                .set_active_configuration(configuration.number())
+                .map_err(io::Error::other)?;
+            handle
                 .claim_interface(interface)
+                .map_err(io::Error::other)?;
+            handle
+                .set_alternate_setting(interface, 0)
                 .map_err(io::Error::other)?;
             // Match the Python transport: a status block can outlive the
             // process which requested it, so discard stale replies before a
@@ -412,7 +432,7 @@ pub mod usb {
                 handle,
                 out,
                 input,
-                payload_limit,
+                payload_limit: payload_limit.max(1).min(packet_size.max(1)),
                 timeout: Duration::from_secs(3),
             })
         }
@@ -421,14 +441,27 @@ pub mod usb {
         fn payload_limit(&self) -> usize {
             self.payload_limit
         }
+        fn command_limit(&self) -> usize {
+            // libusb accepts one logical bulk transfer and packetizes it for
+            // the endpoint. The working Python driver relies on this for the
+            // 200-byte Brother invalidate command.
+            usize::MAX
+        }
         fn subscribe_notifications(&mut self) -> Result<(), String> {
             Ok(())
         }
         fn write(&mut self, b: &[u8]) -> Result<(), String> {
-            self.handle
+            let written = self
+                .handle
                 .write_bulk(self.out, b, self.timeout)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+                .map_err(|e| e.to_string())?;
+            if written != b.len() {
+                return Err(format!(
+                    "short USB bulk write: accepted {written} of {} bytes",
+                    b.len()
+                ));
+            }
+            Ok(())
         }
         fn delay_monotonic(&mut self, ms: u64) {
             thread::sleep(Duration::from_millis(ms))
@@ -447,7 +480,7 @@ pub mod usb {
                 match self.handle.read_bulk(endpoint, &mut b, remaining) {
                     // QL printers can return zero-length USB packets while a
                     // status reply is being prepared; keep polling.
-                    Ok(0) => continue,
+                    Ok(0) => thread::sleep(Duration::from_millis(50)),
                     Ok(n) => {
                         b.truncate(n);
                         return Ok(WaitOutcome::Response(b));
