@@ -15,6 +15,31 @@ paths:
     get: {summary: Read configured connection status and media, security: [{bearer: []}]}
   /v1/jobs:
     post: {summary: Submit an editor or canonical v4 document, security: [{bearer: []}]}
+  /v1/jobs/{id}:
+    get:
+      summary: Poll persisted job progress or terminal outcome
+      security: [{bearer: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+  /v1/jobs/{id}/events:
+    get:
+      summary: Stream job progress as server-sent events
+      security: [{bearer: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+  /v1/jobs/{id}/cancel:
+    post:
+      summary: Request cooperative cancellation
+      security: [{bearer: []}]
+      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+  /v1/printers:
+    get: {summary: List definitions plus configured and discovered printers, security: [{bearer: []}]}
+  /v1/documents/validate:
+    post: {summary: Validate a canonical or editor v4 document, security: [{bearer: []}]}
+  /v1/documents/preview:
+    post:
+      summary: Render a canonical or editor v4 document as PNG
+      security: [{bearer: []}]
+      responses:
+        "200": {description: PNG preview, content: {image/png: {schema: {type: string, contentEncoding: binary}}}}
   /v1/documents/export:
     post:
       summary: Export a canonical or editor v4 document as PNG or exact-geometry PDF
@@ -34,7 +59,9 @@ paths:
         "401": {description: Invalid origin-bound bearer token}
         "422": {description: Invalid or unrenderable document}
   /v1/laposte/extract:
-    post: {summary: Reserved for SDK-normalized La Poste PDF extraction, security: [{bearer: []}]}
+    post: {summary: Extract occupied exact-size La Poste slots from a base64 PDF, security: [{bearer: []}]}
+  /v1/assets:
+    get: {summary: List locally installed private asset catalogues, security: [{bearer: []}]}
 components:
   securitySchemes:
     bearer: {type: http, scheme: bearer}

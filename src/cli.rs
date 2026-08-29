@@ -334,6 +334,11 @@ pub enum ApiCommand {
     Revoke {
         id: String,
     },
+    Rotate {
+        id: String,
+        #[arg(long, default_value_t = 2_592_000)]
+        expires_seconds: u64,
+    },
 }
 
 #[cfg(test)]

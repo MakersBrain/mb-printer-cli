@@ -7,6 +7,10 @@
 - Required explicit or saved print transports and persisted bounded jobs.
 - Added authenticated La Poste extraction API, release SBOM/checksums, and
   multi-platform pinned-action builds.
+- Added persistent bearer-grant rotation and aligned saved RFCOMM jobs with
+  the native MAC/channel transport contract.
+- Reject empty La Poste sheets before opening a transport and generate a real
+  pinned CycloneDX 1.5 release SBOM.
 
 This project follows Semantic Versioning. The loopback API is independently
 versioned by its `/v1` path; breaking API or document changes require a new

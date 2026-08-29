@@ -33,10 +33,13 @@ jobs:
       - shell: bash
         run: cargo build --locked --release --features "${{ matrix.features }}"
       - shell: bash
+        run: cargo install cargo-cyclonedx --version 0.5.7 --locked
+      - shell: bash
         run: |
           cp "target/release/${{ matrix.binary }}" "${{ matrix.artifact }}"
           shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
-          cargo metadata --locked --format-version 1 > "${{ matrix.artifact }}.sbom.json"
+          cargo cyclonedx --format json --spec-version 1.5 --override-filename "${{ matrix.artifact }}.sbom.json"
+          test -s "${{ matrix.artifact }}.sbom.json"
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:
           name: ${{ matrix.artifact }}

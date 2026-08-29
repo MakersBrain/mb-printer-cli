@@ -941,9 +941,9 @@ enum ApiTransport {
         baud: u32,
     },
     Rfcomm {
-        path: String,
-        #[serde(default = "default_baud")]
-        baud: u32,
+        address: String,
+        #[serde(default = "default_rfcomm_channel")]
+        channel: u8,
     },
     Usb {
         vid: u16,
@@ -958,6 +958,9 @@ enum ApiTransport {
 }
 const fn default_baud() -> u32 {
     115_200
+}
+const fn default_rfcomm_channel() -> u8 {
+    1
 }
 fn canonical_document(value: &serde_json::Value) -> Result<Document, ApiError> {
     if value
@@ -1159,6 +1162,13 @@ async fn submit_job(
             "BLE transport is unavailable in this build",
         ));
     }
+    #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+    if matches!(transport, ApiTransport::Rfcomm { .. }) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "RFCOMM transport is unavailable in this build",
+        ));
+    }
     let document = canonical_document(&request.document)?;
     if document.validate().is_err() {
         return Err(ApiError(
@@ -1254,10 +1264,20 @@ async fn submit_job(
                     .map_err(|error| (error.to_string(), None))
                     .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
             }
-            ApiTransport::Rfcomm { path, baud } => {
-                SerialTransport::open(std::path::Path::new(&path), baud, request.payload_limit)
-                    .map_err(|error| (error.to_string(), None))
-                    .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
+            #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+            ApiTransport::Rfcomm { address, channel } => {
+                mb_printer_native::transports::rfcomm::RfcommTransport::bind(
+                    0,
+                    &address,
+                    channel,
+                    request.payload_limit,
+                )
+                .map_err(|error| (error, None))
+                .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
+            }
+            #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+            ApiTransport::Rfcomm { .. } => {
+                Err(("RFCOMM support is unavailable in this build".into(), None))
             }
             #[cfg(feature = "usb")]
             ApiTransport::Usb {
@@ -1463,6 +1483,12 @@ async fn laposte_extract(
                 "La Poste extraction failed",
             )
         })?;
+    if stamps.is_empty() {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "La Poste sheet contains no occupied stamps",
+        ));
+    }
     Ok(Json(
         serde_json::json!({"stamps":stamps.iter().map(|stamp|serde_json::json!({"page":stamp.page,"slot":stamp.slot,"widthUm":stamp.width_um,"heightUm":stamp.height_um,"raster":{"width":stamp.raster.width,"height":stamp.raster.height,"pixelsBase64":base64::engine::general_purpose::STANDARD.encode(&stamp.raster.pixels)}})).collect::<Vec<_>>() }),
     ))

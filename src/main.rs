@@ -425,7 +425,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 execute_plan(&plan, &record_options).await?;
             }
         }
-        Command::DensityTest { options } => {
+        Command::DensityTest { mut options } => {
+            apply_config_defaults(&mut options, &cfg)?;
             let model = options.model.as_deref().ok_or("--model is required")?;
             let printer = capabilities::by_id(model).ok_or("unknown printer model")?;
             let width_bytes = 40u16;
@@ -454,26 +455,31 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Command::PrintPdf(args) => {
-            laposte::validate_a4(&args.input, &args.options.page)?;
-            let model = args
-                .options
+            let mut options = args.options;
+            apply_config_defaults(&mut options, &cfg)?;
+            laposte::validate_a4(&args.input, &options.page)?;
+            let model = options
                 .model
                 .as_deref()
                 .ok_or("--model is required for La Poste printing")?;
             let printer = capabilities::by_id(model)
                 .ok_or_else(|| format!("unknown printer model {model}"))?;
-            let dpi = args.options.dpi.unwrap_or(printer.dpi);
+            let dpi = options.dpi.unwrap_or(printer.dpi);
             let stamps =
-                laposte::extract_pdf(&args.input, args.laposte_format, dpi, &args.options.page)?;
+                laposte::extract_pdf(&args.input, args.laposte_format, dpi, &options.page)?;
+            if stamps.is_empty() {
+                return Err("La Poste sheet contains no occupied stamps".into());
+            }
             for (index, stamp) in stamps.iter().enumerate() {
-                let plan = plan_stamp(stamp, &printer, &args.options)?;
-                let mut options = args.options.clone();
+                let plan = plan_stamp(stamp, &printer, &options)?;
+                let mut stamp_options = options.clone();
                 if stamps.len() > 1
-                    && let Some(path) = &args.options.capture
+                    && let Some(path) = &options.capture
                 {
-                    options.capture = Some(path.with_extension(format!("{}.json", index + 1)));
+                    stamp_options.capture =
+                        Some(path.with_extension(format!("{}.json", index + 1)));
                 }
-                execute_plan(&plan, &options).await?;
+                execute_plan(&plan, &stamp_options).await?;
             }
             eprintln!("processed {} occupied La Poste stamps", stamps.len());
         }
@@ -629,6 +635,16 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if !store.revoke(id.parse()?)? {
                         return Err("grant not found".into());
                     }
+                }
+                ApiCommand::Rotate {
+                    id,
+                    expires_seconds,
+                } => {
+                    let mut store = AuthStore::load(store_path)?;
+                    let token = store
+                        .rotate(id.parse()?, Duration::from_secs(expires_seconds))?
+                        .ok_or("grant not found")?;
+                    println!("replacement bearer token (shown once): {token}");
                 }
                 ApiCommand::Serve { bind, port } => {
                     if cfg.allowed_origins.is_empty() {

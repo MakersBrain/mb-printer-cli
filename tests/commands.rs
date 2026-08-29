@@ -365,3 +365,39 @@ fn typed_nested_config_and_test_alias_are_exposed() {
     assert!(help.status.success());
     assert!(String::from_utf8_lossy(&help.stdout).contains("density"));
 }
+
+#[test]
+fn empty_laposte_sheet_fails_before_transport_or_capture() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("empty-a4.pdf");
+    let capture = directory.path().join("must-not-exist.json");
+    let raster = mb_printer_core::raster::MonoRaster {
+        width: 248,
+        height: 351,
+        pixels: vec![0; 248 * 351],
+    };
+    fs::write(
+        &input,
+        mb_printer_core::export::pdf_physical(&raster, 210_000, 297_000).unwrap(),
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_mb-printer"))
+        .args([
+            "print-pdf",
+            input.to_str().unwrap(),
+            "--laposte-format",
+            "L24A",
+            "--model",
+            "m110",
+            "--dpi",
+            "30",
+            "--dry-run",
+            "--capture",
+            capture.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no occupied stamps"));
+    assert!(!capture.exists());
+}

@@ -21,8 +21,8 @@ mb-printer print label.mb-label.json --model tspl-generic --transport tcp://prin
 
 Build with `--features usb` for libusb bulk discovery/execution, or
 `--features bluetooth` for BLE discovery, serialized writes and notification
-waits. Linux Bluetooth Classic printers exposed through a bound
-`/dev/rfcommN` device use `rfcomm:/dev/rfcommN` and the configured `--baud`.
+waits. On Linux, Bluetooth Classic uses BlueZ paired-device discovery and
+`rfcomm:MAC[@CHANNEL]`; the SDK binds the selected `/dev/rfcommN` endpoint.
 Tagged release artifacts carry the `-full` suffix and are built with both
 `usb,bluetooth`; Linux CI installs the D-Bus development headers required by
 the BLE backend. Minimal source builds retain an empty default feature set.
@@ -41,8 +41,8 @@ deterministic tests. Browser access uses an exact origin allowlist, independent
 loopback Host validation and valid-preflight-only Private Network Access. See
 `docs/openapi.yaml` for the versioned wire contract.
 
-USB and BLE implementations are feature-gated. Bluetooth Classic uses the
-operating system's bound `rfcomm` serial device; actual hardware discovery and
+USB and BLE implementations are feature-gated. Bluetooth Classic uses BlueZ's
+RFCOMM tooling; actual hardware discovery and
 printing still depend on platform permissions, drivers, and device-specific
 endpoint/characteristic values. Dry-run captures preserve the logical plan,
 physical writes, timing, and concatenated byte stream.

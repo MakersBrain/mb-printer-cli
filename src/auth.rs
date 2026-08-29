@@ -162,6 +162,22 @@ impl AuthStore {
         self.persist()?;
         Ok(true)
     }
+    /// Replace a grant's bearer secret while preserving its origin and ID.
+    /// The previous token stops authenticating as soon as this method returns.
+    pub fn rotate(&mut self, id: Uuid, ttl: Duration) -> io::Result<Option<String>> {
+        let Some(grant) = self.grants.get_mut(&id) else {
+            return Ok(None);
+        };
+        let token = random_string(32);
+        let salt = random_string(16);
+        grant.token_hash = URL_SAFE_NO_PAD.encode(digest(&salt, &token));
+        grant.token_salt = salt;
+        grant.created_at = now();
+        grant.expires_at = now().saturating_add(ttl.as_secs().min(31_536_000));
+        grant.revoked_at = None;
+        self.persist()?;
+        Ok(Some(token))
+    }
     pub fn grants(&self) -> Vec<Grant> {
         let mut values: Vec<_> = self.grants.values().cloned().collect();
         values.sort_by_key(|g| g.created_at);
@@ -261,6 +277,35 @@ mod tests {
             !String::from_utf8(fs::read(path).unwrap())
                 .unwrap()
                 .contains(&token)
+        );
+    }
+    #[test]
+    fn rotation_invalidates_old_token_and_survives_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("grants.json");
+        let mut auth = AuthStore::load(&path).unwrap();
+        let pairing = auth.begin_pairing(Duration::from_secs(30)).unwrap();
+        let (id, old) = auth
+            .exchange(
+                &pairing.value,
+                "https://editor.example",
+                Duration::from_secs(60),
+            )
+            .unwrap()
+            .unwrap();
+        let new = auth.rotate(id, Duration::from_secs(120)).unwrap().unwrap();
+        assert!(auth.authenticate(&old, "https://editor.example").is_none());
+        assert!(auth.authenticate(&new, "https://editor.example").is_some());
+        let reloaded = AuthStore::load(path).unwrap();
+        assert!(
+            reloaded
+                .authenticate(&old, "https://editor.example")
+                .is_none()
+        );
+        assert!(
+            reloaded
+                .authenticate(&new, "https://editor.example")
+                .is_some()
         );
     }
     #[test]
