@@ -17,3 +17,5 @@ mb-printer api serve
 
 There is no `mbprint` or Python compatibility command.
 
+Release maintainers should follow [the release process](release.md); local
+candidate generation never creates a tag or publishes an artifact.

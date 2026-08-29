@@ -29,6 +29,8 @@ jobs:
           rustup default 1.92.0
           test "$(rustc --version | cut -d' ' -f2)" = 1.92.0
       - shell: bash
+        run: sh scripts/check_release_version.sh "${{ github.ref_name }}"
+      - shell: bash
         run: cargo test --locked --all-targets --features "${{ matrix.features }}"
       - shell: bash
         run: cargo build --locked --release --features "${{ matrix.features }}"
@@ -38,7 +40,7 @@ jobs:
         run: |
           cp "target/release/${{ matrix.binary }}" "${{ matrix.artifact }}"
           shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
-          cargo cyclonedx --format json --spec-version 1.5 --override-filename "${{ matrix.artifact }}.sbom.json"
+          cargo cyclonedx --format json --spec-version 1.5 --override-filename "${{ matrix.artifact }}.sbom"
           test -s "${{ matrix.artifact }}.sbom.json"
       - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
         with:

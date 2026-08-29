@@ -12,7 +12,7 @@ readme = "README.md"
 rust-version = "1.92"
 categories = ["command-line-utilities", "hardware-support"]
 keywords = ["label", "printer", "thermal", "escpos", "brother"]
-include = ["src/**", "tests/**", "docs/**", ".github/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE.md", "THIRD_PARTY_LICENSES.md"]
+include = ["src/**", "tests/**", "docs/**", "scripts/**", ".github/**", "Cargo.toml", "Cargo.lock", "README.md", "CHANGELOG.md", "LICENSE", "NOTICE.md", "THIRD_PARTY_LICENSES.md"]
 
 [features]
 default = []
