@@ -341,8 +341,7 @@ async fn printers(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers).await?;
-    let mut devices = state.injected_devices.read().await.clone();
-    devices.extend(crate::transport::discover_native().unwrap_or_default());
+    let devices = discovered_devices(&state).await;
     let discovered = devices
         .into_iter()
         .map(|device| {
@@ -378,8 +377,7 @@ async fn discovery(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers).await?;
-    let mut devices = state.injected_devices.read().await.clone();
-    devices.extend(crate::transport::discover_native().unwrap_or_default());
+    let devices = discovered_devices(&state).await;
     Ok(Json(
         serde_json::json!({"devices":devices,"supportedTransports":["file","tcp","serial","usb","ble","rfcomm"]}),
     ))
@@ -420,10 +418,7 @@ async fn connection(
     let probe = if let Some(probe) = state.injected_probes.read().await.get(&request.id).cloned() {
         probe
     } else {
-        let transport = request.transport.clone();
-        tokio::task::spawn_blocking(move || probe_transport(&transport))
-            .await
-            .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "connection probe crashed"))??
+        probe_transport_async(request.transport.clone()).await?
     };
     let configured = Connection {
         id: request.id,
@@ -536,6 +531,232 @@ fn probe_transport(transport: &serde_json::Value) -> Result<ProbeResult, ApiErro
         media: None,
     })
 }
+
+async fn discovered_devices(state: &ApiState) -> Vec<crate::transport::NativeDevice> {
+    let mut devices = state.injected_devices.read().await.clone();
+    devices.extend(
+        tokio::task::spawn_blocking(crate::transport::discover_native)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .unwrap_or_default(),
+    );
+    #[cfg(feature = "bluetooth")]
+    devices.extend(
+        crate::transport::bluetooth::discover()
+            .await
+            .unwrap_or_default(),
+    );
+    devices.sort_by(|left, right| {
+        (&left.transport, &left.address).cmp(&(&right.transport, &right.address))
+    });
+    devices
+        .dedup_by(|left, right| left.transport == right.transport && left.address == right.address);
+    devices
+}
+
+async fn probe_transport_async(transport: serde_json::Value) -> Result<ProbeResult, ApiError> {
+    if transport["kind"] == "ble" {
+        #[cfg(feature = "bluetooth")]
+        {
+            let address = transport["address"].as_str().ok_or(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "BLE address required",
+            ))?;
+            crate::transport::bluetooth::BleTransport::connect(address, 128)
+                .await
+                .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "BLE probe failed"))?;
+            return Ok(ProbeResult {
+                status: "ready".into(),
+                media: None,
+            });
+        }
+        #[cfg(not(feature = "bluetooth"))]
+        return Err(ApiError(
+            StatusCode::BAD_GATEWAY,
+            "BLE unavailable in this build",
+        ));
+    }
+    tokio::task::spawn_blocking(move || probe_transport(&transport))
+        .await
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "connection probe crashed"))?
+}
+
+fn brother_transport_status<T: mb_printer_native::Transport>(
+    transport: &mut T,
+) -> Result<ProbeResult, ApiError> {
+    transport
+        .subscribe_notifications()
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "status subscription failed"))?;
+    transport
+        .write(b"\x1biS")
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "status request failed"))?;
+    let bytes = match transport
+        .wait_response(3_000)
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "status read failed"))?
+    {
+        mb_printer_native::WaitOutcome::Response(bytes) => bytes,
+        mb_printer_native::WaitOutcome::Timeout => {
+            return Err(ApiError(StatusCode::GATEWAY_TIMEOUT, "status timed out"));
+        }
+        mb_printer_native::WaitOutcome::Unavailable => {
+            return Err(ApiError(
+                StatusCode::BAD_GATEWAY,
+                "status reads unavailable",
+            ));
+        }
+    };
+    let status = crate::device::brother_status(&bytes)
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "invalid Brother status"))?;
+    Ok(ProbeResult {
+        status: if status.errors.is_empty() {
+            status.phase.clone()
+        } else {
+            "error".into()
+        },
+        media: Some(serde_json::json!({
+            "widthMm":status.media_width_mm,
+            "lengthMm":status.media_length_mm,
+            "type":status.media_type,
+            "statusType":status.status_type,
+            "phase":status.phase,
+            "errors":status.errors
+        })),
+    })
+}
+
+fn brother_ipp_status(address: &str) -> Result<ProbeResult, ApiError> {
+    let (host, port) = address
+        .rsplit_once(':')
+        .map_or((address, 631), |(host, port)| {
+            (host, port.parse().unwrap_or(631))
+        });
+    let attributes = crate::device::ipp_query(host, port, Duration::from_secs(3))
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "Brother IPP status failed"))?;
+    let text = |name: &str| {
+        attributes
+            .get(name)
+            .and_then(|values| values.first())
+            .and_then(|value| match value {
+                crate::device::IppValue::Text(value) => Some(value.clone()),
+                _ => None,
+            })
+    };
+    let keyword = text("media-ready").or_else(|| text("media-default"));
+    let size = keyword.as_deref().and_then(crate::device::ipp_media_size);
+    Ok(ProbeResult {
+        status: text("printer-state").unwrap_or_else(|| "ipp-response".into()),
+        media: Some(serde_json::json!({
+            "keyword":keyword,
+            "widthMm":size.map(|size|size.0),
+            "lengthMm":size.map(|size|size.1),
+            "reasons":attributes.get("printer-state-reasons")
+        })),
+    })
+}
+
+async fn printer_status_async(connection: &Connection) -> Result<ProbeResult, ApiError> {
+    let Some(definition) = capabilities::by_id(&connection.model) else {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown printer model",
+        ));
+    };
+    if definition.protocol != mb_printer_core::capabilities::Protocol::Brother {
+        return probe_transport_async(connection.transport.clone()).await;
+    }
+    let transport = connection.transport.clone();
+    match transport["kind"].as_str().unwrap_or_default() {
+        "tcp" if transport["statusMode"] != "raster" => {
+            let address = transport["statusAddress"]
+                .as_str()
+                .or_else(|| transport["address"].as_str())
+                .ok_or(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "TCP address required",
+                ))?
+                .to_owned();
+            tokio::task::spawn_blocking(move || brother_ipp_status(&address))
+                .await
+                .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "IPP status task crashed"))?
+        }
+        "tcp" => {
+            let address = transport["address"]
+                .as_str()
+                .ok_or(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "TCP address required",
+                ))?
+                .to_owned();
+            tokio::task::spawn_blocking(move || {
+                let mut target = TcpTransport::connect(&address, 128, Duration::from_secs(3))
+                    .map_err(|_| {
+                        ApiError(StatusCode::BAD_GATEWAY, "TCP status connection failed")
+                    })?;
+                brother_transport_status(&mut target)
+            })
+            .await
+            .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "TCP status task crashed"))?
+        }
+        "serial" => tokio::task::spawn_blocking(move || {
+            let path = transport["path"].as_str().ok_or(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "serial path required",
+            ))?;
+            let mut target = SerialTransport::open(
+                std::path::Path::new(path),
+                transport["baud"].as_u64().unwrap_or(115_200) as u32,
+                128,
+            )
+            .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "serial status connection failed"))?;
+            brother_transport_status(&mut target)
+        })
+        .await
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "serial status task crashed"))?,
+        #[cfg(feature = "usb")]
+        "usb" => tokio::task::spawn_blocking(move || {
+            let mut target = crate::transport::usb::UsbTransport::open(
+                transport["vid"].as_u64().unwrap_or(0) as u16,
+                transport["pid"].as_u64().unwrap_or(0) as u16,
+                transport["interface"].as_u64().unwrap_or(0) as u8,
+                transport["out"].as_u64().unwrap_or(0) as u8,
+                transport["input"].as_u64().map(|value| value as u8),
+                128,
+            )
+            .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "USB status connection failed"))?;
+            brother_transport_status(&mut target)
+        })
+        .await
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "USB status task crashed"))?,
+        #[cfg(feature = "bluetooth")]
+        "ble" => {
+            let address = transport["address"].as_str().ok_or(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "BLE address required",
+            ))?;
+            let mut target = crate::transport::bluetooth::BleTransport::connect(address, 128)
+                .await
+                .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "BLE status connection failed"))?;
+            brother_transport_status(&mut target)
+        }
+        #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+        "rfcomm" => tokio::task::spawn_blocking(move || {
+            let address = transport["address"].as_str().ok_or(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "RFCOMM address required",
+            ))?;
+            let channel = transport["channel"].as_u64().unwrap_or(1) as u8;
+            let mut target = mb_printer_native::transports::rfcomm::RfcommTransport::bind(
+                0, address, channel, 128,
+            )
+            .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "RFCOMM status connection failed"))?;
+            brother_transport_status(&mut target)
+        })
+        .await
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "RFCOMM status task crashed"))?,
+        _ => probe_transport_async(transport).await,
+    }
+}
 #[derive(Deserialize)]
 struct StatusQuery {
     connection: Option<String>,
@@ -560,7 +781,7 @@ async fn status(
                 if let Some(probe) = state.injected_probes.read().await.get(&value.id).cloned() {
                     Ok(probe)
                 } else {
-                    probe_transport(&value.transport)
+                    printer_status_async(&value).await
                 };
             let (connected, status, media) = match live {
                 Ok(probe) => (true, probe.status, probe.media.or(value.media.clone())),
@@ -1638,6 +1859,34 @@ mod tests {
         let progress = error.1.unwrap();
         assert!(progress.potentially_accepted_write);
         assert_eq!(progress.bytes_written, 0);
+    }
+    #[tokio::test(flavor = "multi_thread")]
+    async fn selected_brother_tcp_status_reports_live_media() {
+        use std::io::{Read as _, Write as _};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 3];
+            stream.read_exact(&mut request).unwrap();
+            assert_eq!(&request, b"\x1biS");
+            let mut reply = [0_u8; 32];
+            reply[..3].copy_from_slice(&[0x80, 0x20, 0x42]);
+            reply[10] = 62;
+            reply[11] = 0x0b;
+            reply[17] = 29;
+            stream.write_all(&reply).unwrap();
+        });
+        let connection = Connection {
+            id: "brother".into(),
+            model: "ql-1110nwb".into(),
+            transport: serde_json::json!({"kind":"tcp","address":address.to_string(),"statusMode":"raster"}),
+            status: "ready".into(),
+            media: None,
+        };
+        let result = printer_status_async(&connection).await.unwrap();
+        server.join().unwrap();
+        assert_eq!(result.media.unwrap()["widthMm"], 62);
     }
     #[test]
     fn native_file_probe_opens_the_backend() {
