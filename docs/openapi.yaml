@@ -1,76 +1,110 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 openapi: 3.1.0
-info: {title: mb-printer loopback API, version: 1.0.0}
-servers: [{url: "http://127.0.0.1:9847"}]
+info:
+  title: mb-printer loopback API
+  version: 1.0.0
+  license: {name: AGPL-3.0-or-later, identifier: AGPL-3.0-or-later}
+servers: [{url: "http://127.0.0.1:9847"}, {url: "http://[::1]:9847"}]
+security: [{bearer: []}]
 paths:
   /v1/pair:
-    post: {summary: Exchange a one-time secret for an origin-bound token}
+    post: {operationId: pair, security: [], requestBody: {$ref: "#/components/requestBodies/Pair"}, responses: {"200": {$ref: "#/components/responses/Pair"}, "401": {$ref: "#/components/responses/Error"}}}
+  /v1/grants/me:
+    get: {operationId: currentGrant, responses: {"200": {description: Current origin-bound grant, content: {application/json: {schema: {$ref: "#/components/schemas/Grant"}}}}, "401": {$ref: "#/components/responses/Error"}}}
+  /v1/grants/me/rotate:
+    post: {operationId: rotateCurrentGrant, requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/RotateGrantRequest"}}}}, responses: {"200": {description: One-time replacement bearer secret, content: {application/json: {schema: {$ref: "#/components/schemas/RotatedGrant"}}}}}}
+  /v1/grants/me/revoke:
+    post: {operationId: revokeCurrentGrant, responses: {"204": {description: Current grant revoked}}}
   /v1/capabilities:
-    get: {summary: SDK and service capabilities, security: [{bearer: []}]}
-  /v1/discovery:
-    post: {summary: Discover native printer transports, security: [{bearer: []}]}
-  /v1/connection:
-    post: {summary: Persist a bounded connection definition, security: [{bearer: []}]}
-  /v1/status:
-    get: {summary: Read configured connection status and media, security: [{bearer: []}]}
-  /v1/jobs:
-    post: {summary: Submit an editor or canonical v4 document, security: [{bearer: []}]}
-  /v1/jobs/{id}:
-    get:
-      summary: Poll persisted job progress or terminal outcome
-      security: [{bearer: []}]
-      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-  /v1/jobs/{id}/events:
-    get:
-      summary: Stream job progress as server-sent events
-      security: [{bearer: []}]
-      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
-  /v1/jobs/{id}/cancel:
-    post:
-      summary: Request cooperative cancellation
-      security: [{bearer: []}]
-      parameters: [{name: id, in: path, required: true, schema: {type: string, format: uuid}}]
+    get: {operationId: capabilities, responses: {"200": {description: Service capabilities, content: {application/json: {schema: {$ref: "#/components/schemas/Capabilities"}}}}}}
   /v1/printers:
-    get: {summary: List definitions plus configured and discovered printers, security: [{bearer: []}]}
+    get: {operationId: printers, responses: {"200": {description: Configured, discovered and bundled printers, content: {application/json: {schema: {$ref: "#/components/schemas/PrintersResponse"}}}}}}
+  /v1/discovery:
+    post: {operationId: discoverPrinters, responses: {"200": {description: Native discovery results, content: {application/json: {schema: {$ref: "#/components/schemas/DiscoveryResponse"}}}}}}
+  /v1/connection:
+    post: {operationId: saveConnection, requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/Connection"}}}}, responses: {"200": {description: Probed and persisted connection, content: {application/json: {schema: {$ref: "#/components/schemas/Connection"}}}}, "422": {$ref: "#/components/responses/Error"}}}
+  /v1/status:
+    get: {operationId: printerStatus, parameters: [{name: connection, in: query, schema: {type: string}}], responses: {"200": {description: Live selected connection status and media, content: {application/json: {schema: {$ref: "#/components/schemas/StatusResponse"}}}}}}
   /v1/documents/validate:
-    post: {summary: Validate a canonical or editor v4 document, security: [{bearer: []}]}
+    post: {operationId: validateDocument, requestBody: {$ref: "#/components/requestBodies/Document"}, responses: {"200": {description: Validation result, content: {application/json: {schema: {$ref: "#/components/schemas/ValidationResult"}}}}, "413": {$ref: "#/components/responses/Error"}}}
   /v1/documents/preview:
     post:
-      summary: Render a canonical or editor v4 document as PNG
-      security: [{bearer: []}]
-      responses:
-        "200": {description: PNG preview, content: {image/png: {schema: {type: string, contentEncoding: binary}}}}
+      operationId: previewDocument
+      parameters: [{name: zoom, in: query, schema: {type: number, exclusiveMinimum: 0, default: 1}}, {name: offsetX, in: query, schema: {type: number, default: 0}}, {name: offsetY, in: query, schema: {type: number, default: 0}}]
+      requestBody: {$ref: "#/components/requestBodies/Document"}
+      responses: {"200": {description: Media-sized PNG viewport, content: {image/png: {schema: {type: string, contentEncoding: binary}}}}, "422": {$ref: "#/components/responses/Error"}}
   /v1/documents/export:
     post:
-      summary: Export a canonical or editor v4 document as PNG or exact-geometry PDF
-      security: [{bearer: []}]
-      parameters:
-        - {name: format, in: query, required: true, schema: {type: string, enum: [png, pdf]}}
-      requestBody:
-        required: true
-        content: {application/json: {schema: {type: object}}}
-      responses:
-        "200":
-          description: Encoded export
-          content:
-            image/png: {schema: {type: string, contentEncoding: binary}}
-            application/pdf: {schema: {type: string, contentEncoding: binary}}
-        "400": {description: Missing or unknown explicit format}
-        "401": {description: Invalid origin-bound bearer token}
-        "422": {description: Invalid or unrenderable document}
-  /v1/laposte/extract:
-    post: {summary: Extract occupied exact-size La Poste slots from a base64 PDF, security: [{bearer: []}]}
+      operationId: exportDocument
+      parameters: [{name: format, in: query, required: true, schema: {type: string, enum: [png, pdf]}}]
+      requestBody: {$ref: "#/components/requestBodies/Document"}
+      responses: {"200": {description: PNG or exact-geometry PDF, content: {image/png: {schema: {type: string, contentEncoding: binary}}, application/pdf: {schema: {type: string, contentEncoding: binary}}}}, "422": {$ref: "#/components/responses/Error"}}
+  /v1/jobs:
+    post:
+      operationId: submitJob
+      parameters: [{name: Idempotency-Key, in: header, schema: {type: string, minLength: 1, maxLength: 128}}]
+      requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/JobRequest"}}}}
+      responses: {"202": {$ref: "#/components/responses/Job"}, "200": {$ref: "#/components/responses/Job"}, "409": {$ref: "#/components/responses/Error"}, "422": {$ref: "#/components/responses/Error"}}
+  /v1/jobs/{id}:
+    get: {operationId: getJob, parameters: [{$ref: "#/components/parameters/JobId"}], responses: {"200": {$ref: "#/components/responses/Job"}, "404": {$ref: "#/components/responses/Error"}}}
+  /v1/jobs/{id}/events:
+    get: {operationId: jobEvents, parameters: [{$ref: "#/components/parameters/JobId"}], responses: {"200": {description: Initial snapshot and progress stream, content: {text/event-stream: {schema: {type: string}}}}, "404": {$ref: "#/components/responses/Error"}}}
+  /v1/jobs/{id}/cancel:
+    post: {operationId: cancelJob, parameters: [{$ref: "#/components/parameters/JobId"}], responses: {"200": {$ref: "#/components/responses/Job"}, "404": {$ref: "#/components/responses/Error"}}}
   /v1/assets:
-    get: {summary: List locally installed private asset catalogues, security: [{bearer: []}]}
+    get: {operationId: installedAssets, responses: {"200": {description: Installed private catalogues, content: {application/json: {schema: {$ref: "#/components/schemas/AssetsResponse"}}}}}}
+  /v1/laposte/extract:
+    post: {operationId: extractLaposte, requestBody: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/LaposteRequest"}}}}, responses: {"200": {description: Selected occupied stamps, content: {application/json: {schema: {$ref: "#/components/schemas/LaposteResponse"}}}}, "422": {$ref: "#/components/responses/Error"}}}
 components:
-  securitySchemes:
-    bearer: {type: http, scheme: bearer}
+  securitySchemes: {bearer: {type: http, scheme: bearer}}
+  parameters: {JobId: {name: id, in: path, required: true, schema: {type: string, format: uuid}}}
+  requestBodies:
+    Pair: {required: true, content: {application/json: {schema: {type: object, additionalProperties: false, required: [secret], properties: {secret: {type: string}}}}}}
+    Document: {required: true, content: {application/json: {schema: {$ref: "#/components/schemas/Document"}}}}
+  responses:
+    Pair: {description: Origin-bound bearer grant, content: {application/json: {schema: {$ref: "#/components/schemas/PairResponse"}}}}
+    Job: {description: Persisted job state, content: {application/json: {schema: {$ref: "#/components/schemas/Job"}}}}
+    Error: {description: Request rejected, content: {application/json: {schema: {$ref: "#/components/schemas/Error"}}}}
   schemas:
-    PairResponse:
+    Error: {type: object, additionalProperties: false, required: [error], properties: {error: {type: string}}}
+    PairResponse: {type: object, additionalProperties: false, required: [grantId, token, expiresAt], properties: {grantId: {type: string, format: uuid}, token: {type: string}, expiresAt: {type: string, format: date-time}}}
+    Grant: {type: object, additionalProperties: false, required: [id, origin, createdAt, expiresAt], properties: {id: {type: string, format: uuid}, origin: {type: string, format: uri}, createdAt: {type: integer}, expiresAt: {type: integer}, revokedAt: {type: [integer, "null"]}}}
+    RotateGrantRequest: {type: object, additionalProperties: false, properties: {expiresSeconds: {type: integer, minimum: 1, maximum: 31536000, default: 2592000}}}
+    RotatedGrant: {type: object, additionalProperties: false, required: [grantId, token, expiresIn], properties: {grantId: {type: string, format: uuid}, token: {type: string}, expiresIn: {type: integer}}}
+    Document:
       type: object
-      required: [grantId, token, expiresAt]
-      properties: {grantId: {type: string, format: uuid}, token: {type: string}, expiresAt: {type: string, format: date-time}}
-    Job:
+      required: [version, media, coordinateSystem, elements, resources, fields]
+      properties:
+        version: {type: integer, const: 4}
+        name: {type: string}
+        media: {type: object, required: [width, height, unit, dpi], properties: {width: {type: number, exclusiveMinimum: 0}, height: {type: number, exclusiveMinimum: 0}, unit: {type: string, enum: [micrometre, mm]}, dpi: {type: integer, minimum: 1}}}
+        coordinateSystem: {type: object}
+        elements: {type: array, items: {type: object}}
+        resources: {type: array, items: {type: object}}
+        fields: {type: array, items: {type: object}}
+    ValidationResult: {type: object, additionalProperties: false, required: [valid, errors], properties: {valid: {type: boolean}, errors: {type: array, items: {type: string}}}}
+    Capabilities: {type: object, additionalProperties: false, required: [service, version, api, features, max_document_bytes, printer_definition_count], properties: {service: {const: mb-printer}, version: {type: string}, api: {const: v1}, features: {type: array, items: {type: string}}, max_document_bytes: {type: integer}, printer_definition_count: {type: integer}}}
+    NativeDevice: {type: object, required: [transport, address], properties: {transport: {type: string}, address: {type: string}, name: {type: [string, "null"]}, vendor_id: {type: integer}, product_id: {type: integer}, serial_number: {type: string}, ieee1284_device_id: {type: string}}}
+    DiscoveryResponse: {type: object, additionalProperties: false, required: [devices, supportedTransports], properties: {devices: {type: array, items: {$ref: "#/components/schemas/NativeDevice"}}, supportedTransports: {type: array, items: {type: string, enum: [file, tcp, serial, usb, ble, rfcomm]}}}}
+    PrintersResponse: {type: object, additionalProperties: false, required: [printers, definitions], properties: {printers: {type: object, required: [discovered, configured], properties: {discovered: {type: array, items: {type: object, required: [source, device], properties: {source: {const: discovery}, device: {$ref: "#/components/schemas/NativeDevice"}, matchedModel: {type: [string, "null"]}}}}, configured: {type: array, items: {$ref: "#/components/schemas/Connection"}}}}, definitions: {type: array, items: {type: object, required: [id, name, protocol, dpi]}}}}
+    StatusResponse: {type: object, required: [connected, status, media], properties: {connection: {$ref: "#/components/schemas/Connection"}, connections: {type: array, items: {$ref: "#/components/schemas/Connection"}}, connected: {type: boolean}, status: {type: string}, media: {type: [object, "null"]}}}
+    AssetsResponse: {type: object, additionalProperties: false, required: [catalogues, visibility], properties: {catalogues: {type: array, items: {type: object}}, visibility: {const: private-local-only}}}
+    Transport:
+      oneOf:
+        - {type: object, additionalProperties: false, required: [kind], properties: {kind: {const: capture}}}
+        - {type: object, additionalProperties: false, required: [kind, path], properties: {kind: {const: file}, path: {type: string}}}
+        - {type: object, additionalProperties: false, required: [kind, address], properties: {kind: {const: tcp}, address: {type: string}}}
+        - {type: object, additionalProperties: false, required: [kind, path], properties: {kind: {const: serial}, path: {type: string}, baud: {type: integer, default: 115200}}}
+        - {type: object, additionalProperties: false, required: [kind, address], properties: {kind: {const: rfcomm}, address: {type: string}, channel: {type: integer, minimum: 1, maximum: 30, default: 1}}}
+        - {type: object, required: [kind, vid, pid, interface, out], properties: {kind: {const: usb}, vid: {type: integer}, pid: {type: integer}, interface: {type: integer}, out: {type: integer}, input: {type: [integer, "null"]}}}
+        - {type: object, additionalProperties: false, required: [kind, address], properties: {kind: {const: ble}, address: {type: string}}}
+    Connection: {type: object, required: [id, model, transport], properties: {id: {type: string}, model: {type: string}, transport: {$ref: "#/components/schemas/Transport"}, status: {type: string}, media: {type: [object, "null"]}}}
+    JobRequest:
       type: object
-      required: [id, state, terminal, lastCompletedAction, bytesSent, action, actions, totalBytes, phase]
-      properties: {id: {type: string, format: uuid}, state: {type: string}, terminal: {type: boolean}, outcome: {type: [string, "null"]}, lastCompletedAction: {type: integer}, bytesSent: {type: integer}, action: {type: integer}, actions: {type: integer}, totalBytes: {type: integer}, phase: {type: string}}
+      required: [document]
+      oneOf: [{required: [connectionId]}, {required: [transport, model]}]
+      properties: {document: {$ref: "#/components/schemas/Document"}, model: {type: string}, printerId: {type: string, deprecated: true}, connectionId: {type: string}, dpi: {type: integer, minimum: 1}, rotation: {type: integer, enum: [0, 90, 180, 270], default: 0}, fit: {type: boolean, default: false}, density: {type: integer, minimum: 1, maximum: 8, default: 6}, copies: {type: integer, minimum: 1, default: 1}, payloadLimit: {type: integer, minimum: 1, default: 512}, transport: {$ref: "#/components/schemas/Transport"}}
+    Job: {type: object, additionalProperties: false, required: [id, state, terminal, lastCompletedAction, bytesSent, action, actions, totalBytes, phase], properties: {id: {type: string, format: uuid}, state: {type: string, enum: [queued, running, cancel-requested, cancelled-before-send, cancelled-partial, outcome-unknown, completed, failed]}, terminal: {type: boolean}, outcome: {type: [string, "null"]}, lastCompletedAction: {type: integer}, bytesSent: {type: integer}, action: {type: integer}, actions: {type: integer}, totalBytes: {type: integer}, phase: {type: string}, error: {type: [string, "null"]}}}
+    LaposteRequest: {type: object, additionalProperties: false, required: [pdfBase64, format], properties: {pdfBase64: {type: string, contentEncoding: base64}, format: {type: string, enum: [L24A, L24B, L21A, L18A, L16A, L14A, L12A, SHEET]}, dpi: {type: integer, minimum: 1, default: 300}, pages: {type: array, items: {type: integer, minimum: 1}}, slots: {type: array, items: {type: string, pattern: "^[1-9][0-9]*:[1-9][0-9]*$"}}}}
+    Stamp: {type: object, required: [page, slot, widthUm, heightUm, raster], properties: {page: {type: integer}, slot: {type: integer}, widthUm: {type: integer, const: 63500}, heightUm: {type: integer, const: 33900}, raster: {type: object, required: [width, height, pixelsBase64], properties: {width: {type: integer}, height: {type: integer}, pixelsBase64: {type: string, contentEncoding: base64}}}}}
+    LaposteResponse: {type: object, additionalProperties: false, required: [stamps], properties: {stamps: {type: array, minItems: 1, items: {$ref: "#/components/schemas/Stamp"}}}}

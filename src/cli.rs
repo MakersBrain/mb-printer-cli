@@ -272,6 +272,9 @@ pub struct LapostePrintArgs {
     pub input: PathBuf,
     #[arg(long)]
     pub laposte_format: LaposteFormat,
+    /// Print only occupied one-based `page:slot` entries (repeatable).
+    #[arg(long = "slot")]
+    pub slots: Vec<String>,
     #[command(flatten)]
     pub options: PrintOptions,
 }
@@ -287,6 +290,9 @@ pub struct LaposteExtractArgs {
     pub dpi: u16,
     #[arg(long)]
     pub page: Vec<u32>,
+    /// Export only occupied one-based `page:slot` entries (repeatable).
+    #[arg(long = "slot")]
+    pub slots: Vec<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -321,8 +327,9 @@ pub enum AssetCommand {
 #[derive(Debug, Subcommand)]
 pub enum ApiCommand {
     Serve {
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: std::net::IpAddr,
+        /// Bind one explicit loopback address; by default both IPv4 and IPv6 are served.
+        #[arg(long)]
+        bind: Option<std::net::IpAddr>,
         #[arg(long, default_value_t = 9847)]
         port: u16,
     },
@@ -354,6 +361,8 @@ mod tests {
             "sheet.pdf",
             "--laposte-format",
             "SHEET",
+            "--slot",
+            "1:4",
             "--dry-run",
         ])
         .unwrap();
@@ -361,6 +370,7 @@ mod tests {
             panic!()
         };
         assert_eq!(args.laposte_format, LaposteFormat::L24ASheet);
+        assert_eq!(args.slots, ["1:4"]);
         assert!(args.options.dry_run);
     }
 

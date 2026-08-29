@@ -9,6 +9,7 @@ use axum::{
     routing::{get, post},
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     convert::Infallible,
@@ -248,15 +249,84 @@ fn bearer(headers: &HeaderMap) -> Result<&str, ApiError> {
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or(ApiError(StatusCode::UNAUTHORIZED, "missing bearer token"))
 }
-async fn authorize(state: &ApiState, headers: &HeaderMap) -> Result<(), ApiError> {
+async fn authorize(state: &ApiState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
     validate_host(headers)?;
     let o = origin(headers)?;
     let token = bearer(headers)?;
-    if state.auth.read().await.authenticate(token, o).is_some() {
-        Ok(())
+    if let Some(grant) = state.auth.read().await.authenticate(token, o) {
+        Ok(grant.id)
     } else {
         Err(ApiError(StatusCode::UNAUTHORIZED, "invalid grant"))
     }
+}
+
+async fn current_grant(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = authorize(&state, &headers).await?;
+    let grant = state
+        .auth
+        .read()
+        .await
+        .grants()
+        .into_iter()
+        .find(|grant| grant.id == id)
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED, "invalid grant"))?;
+    Ok(Json(
+        serde_json::json!({"id":grant.id,"origin":grant.origin,"createdAt":grant.created_at,"expiresAt":grant.expires_at,"revokedAt":grant.revoked_at}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RotateGrantRequest {
+    #[serde(default = "default_grant_ttl")]
+    expires_seconds: u64,
+}
+const fn default_grant_ttl() -> u64 {
+    30 * 24 * 3600
+}
+async fn rotate_current_grant(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<RotateGrantRequest>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let id = authorize(&state, &headers).await?;
+    if request.expires_seconds == 0 || request.expires_seconds > 31_536_000 {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "expiresSeconds must be between 1 and 31536000",
+        ));
+    }
+    let token = state
+        .auth
+        .write()
+        .await
+        .rotate(id, Duration::from_secs(request.expires_seconds))
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "grant persistence failed",
+            )
+        })?
+        .ok_or(ApiError(StatusCode::UNAUTHORIZED, "invalid grant"))?;
+    Ok(Json(
+        serde_json::json!({"grantId":id,"token":token,"expiresIn":request.expires_seconds.min(31_536_000)}),
+    ))
+}
+async fn revoke_current_grant(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let id = authorize(&state, &headers).await?;
+    state.auth.write().await.revoke(id).map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "grant persistence failed",
+        )
+    })?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn preflight_guard(
@@ -333,7 +403,7 @@ async fn capabilities(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers).await?;
     Ok(Json(
-        serde_json::json!({"service":"mb-printer","version":VERSION,"api":"v1","features":["documents","preview-png","jobs","assets","laposte","file-transport","tcp-transport","serial-transport"],"max_document_bytes":state.config.max_document_bytes,"printer_definition_count":capabilities::bundled().len()}),
+        serde_json::json!({"service":"mb-printer","version":VERSION,"api":"v1","features":["documents","preview-png","jobs","job-idempotency","job-fit","self-service-grants","dual-stack-loopback","assets","laposte","file-transport","tcp-transport","serial-transport"],"max_document_bytes":state.config.max_document_bytes,"printer_definition_count":capabilities::bundled().len()}),
     ))
 }
 async fn printers(
@@ -833,8 +903,22 @@ fn parse_document(body: &[u8]) -> Result<Document, ApiError> {
     }
     Ok(document)
 }
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PreviewQuery {
+    #[serde(default = "default_zoom")]
+    zoom: f64,
+    #[serde(default)]
+    offset_x: f64,
+    #[serde(default)]
+    offset_y: f64,
+}
+const fn default_zoom() -> f64 {
+    1.0
+}
 async fn preview_document(
     State(state): State<ApiState>,
+    Query(query): Query<PreviewQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
@@ -852,6 +936,8 @@ async fn preview_document(
             "document cannot be rasterized",
         )
     })?;
+    let image = raster::preview_transform(&image, query.zoom, query.offset_x, query.offset_y)
+        .map_err(|_| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid preview viewport"))?;
     let png = raster::png(&image, document.media.dpi)
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "PNG encoding failed"))?;
     Ok(([(http::header::CONTENT_TYPE, "image/png")], png).into_response())
@@ -916,6 +1002,10 @@ struct JobRequest {
     connection_id: Option<String>,
     #[serde(default)]
     dpi: Option<u16>,
+    #[serde(default)]
+    rotation: u16,
+    #[serde(default)]
+    fit: bool,
     #[serde(default = "default_density")]
     density: u8,
     #[serde(default = "default_copies")]
@@ -1007,6 +1097,101 @@ fn canonical_document(value: &serde_json::Value) -> Result<Document, ApiError> {
         )
     })
 }
+fn api_render_for_printer(
+    document: &Document,
+    printer: &mb_printer_core::capabilities::PrinterDefinition,
+    dpi: u16,
+    rotation: u16,
+    fit: bool,
+    media_box: Option<(u32, u32)>,
+) -> Result<mb_printer_core::protocol::Raster, ApiError> {
+    use mb_printer_core::raster::{Fit, Rotation};
+    if printer.width_px().is_none() && media_box.is_none() {
+        if rotation != 0 || fit {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "rotation/fit require a fixed-width printer model",
+            ));
+        }
+        return raster::render_for_printer(document, printer, dpi).map_err(|_| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "document cannot be rasterized",
+            )
+        });
+    }
+    let mut mono = raster::render(document, dpi).map_err(|_| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "document cannot be rasterized",
+        )
+    })?;
+    mono = match rotation {
+        0 => mono,
+        90 => mono.rotate(Rotation::Clockwise90),
+        180 => mono.rotate(Rotation::Half),
+        270 => mono.rotate(Rotation::CounterClockwise90),
+        _ => {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid rotation",
+            ));
+        }
+    };
+    if printer.rotated {
+        mono = mono.rotate(Rotation::Clockwise90);
+    }
+    let head = printer
+        .width_px()
+        .or_else(|| media_box.map(|(width, _)| width))
+        .expect("fixed model or loaded media checked above");
+    if fit
+        && let Some((media_width, media_height)) = media_box
+        && (mono.width > media_width || mono.height > media_height)
+    {
+        mono = raster::fit_to_box(&mono, media_width.min(head), media_height).map_err(|_| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "document cannot be fitted to loaded media",
+            )
+        })?;
+    }
+    if mono.width > head {
+        if !fit {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "rendered document exceeds printer head; set fit=true",
+            ));
+        }
+        mono = raster::scale_to_width(&mono, head).map_err(|_| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "document cannot be fitted",
+            )
+        })?;
+    }
+    let alignment = match printer.alignment {
+        mb_printer_core::capabilities::Alignment::Left => Fit::Left,
+        mb_printer_core::capabilities::Alignment::Center => Fit::Center,
+        mb_printer_core::capabilities::Alignment::Right => Fit::Right,
+    };
+    let mono = mono
+        .place_on_head_byte_aligned(head, alignment, 0, 0)
+        .map_err(|_| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "document cannot be placed",
+            )
+        })?;
+    Ok(mb_printer_core::protocol::Raster {
+        width_bytes: u16::try_from(mono.width.div_ceil(8))
+            .map_err(|_| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "raster is too wide"))?,
+        height: mono.height,
+        data: mono
+            .pack_msb()
+            .map_err(|_| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "raster packing failed"))?,
+    })
+}
 const fn default_density() -> u8 {
     6
 }
@@ -1082,25 +1267,43 @@ async fn submit_job(
             "document too large",
         ));
     }
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .map(|value| {
+            value
+                .to_str()
+                .map(str::to_owned)
+                .map_err(|_| ApiError(StatusCode::BAD_REQUEST, "invalid idempotency key"))
+        })
+        .transpose()?;
+    if idempotency_key
+        .as_deref()
+        .is_some_and(|key| key.is_empty() || key.len() > 128 || !key.is_ascii())
     {
-        let mut jobs = state.jobs.write().await;
-        if jobs.len() >= state.config.max_recent_jobs {
-            let removable = jobs
-                .values()
-                .filter(|job| job.terminal())
-                .min_by_key(|job| job.updated_at_ms)
-                .map(|job| job.id);
-            if let Some(id) = removable {
-                jobs.remove(&id);
-                state.events.write().await.remove(&id);
-                state.cancellations.write().await.remove(&id);
-            } else {
-                return Err(ApiError(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "all retained jobs are active",
-                ));
-            }
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid idempotency key"));
+    }
+    let request_hash = format!("{:x}", Sha256::digest(&body));
+    let scoped_key = idempotency_key.as_ref().map(|key| {
+        format!(
+            "{}\0{key}",
+            origin(&headers).expect("authorization already validated origin")
+        )
+    });
+    if let Some(key) = &scoped_key
+        && let Some(existing) = state
+            .jobs
+            .read()
+            .await
+            .values()
+            .find(|job| job.idempotency_key.as_deref() == Some(key))
+    {
+        if existing.request_hash.as_deref() != Some(&request_hash) {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "idempotency key was used for a different request",
+            ));
         }
+        return Ok((StatusCode::OK, Json(JobView::from(existing))));
     }
     let request: JobRequest = serde_json::from_slice(&body)
         .map_err(|_| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid job request"))?;
@@ -1116,7 +1319,7 @@ async fn submit_job(
             "provide exactly one of connectionId or transport",
         ));
     }
-    let (model, transport) = if let Some(id) = &request.connection_id {
+    let (model, transport, loaded_media) = if let Some(id) = &request.connection_id {
         let connections = state.connections.read().await;
         let connection = connections.get(id).ok_or(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1138,7 +1341,11 @@ async fn submit_job(
                 "saved connection transport is invalid",
             )
         })?;
-        (connection.model.clone(), transport)
+        (
+            connection.model.clone(),
+            transport,
+            connection.media.clone(),
+        )
     } else {
         (
             request.model.clone().ok_or(ApiError(
@@ -1146,6 +1353,7 @@ async fn submit_job(
                 "printerId/model is required",
             ))?,
             request.transport.clone().unwrap(),
+            None,
         )
     };
     #[cfg(not(feature = "usb"))]
@@ -1180,14 +1388,57 @@ async fn submit_job(
         StatusCode::UNPROCESSABLE_ENTITY,
         "unknown printer model",
     ))?;
-    let packed =
-        raster::render_for_printer(&document, &printer, request.dpi.unwrap_or(printer.dpi))
-            .map_err(|_| {
-                ApiError(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "document cannot be rasterized",
-                )
-            })?;
+    if !matches!(request.rotation, 0 | 90 | 180 | 270) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid rotation",
+        ));
+    }
+    let (document_width_mm, document_height_mm) = if matches!(request.rotation, 90 | 270) {
+        (
+            document.media.height as f64 / 1000.0,
+            document.media.width as f64 / 1000.0,
+        )
+    } else {
+        (
+            document.media.width as f64 / 1000.0,
+            document.media.height as f64 / 1000.0,
+        )
+    };
+    if !request.fit
+        && loaded_media.as_ref().is_some_and(|media| {
+            let width = media.get("widthMm").and_then(serde_json::Value::as_f64);
+            let length = media.get("lengthMm").and_then(serde_json::Value::as_f64);
+            width.is_some_and(|width| document_width_mm > width + 0.5)
+                || (!document.media.continuous
+                    && length.is_some_and(|length| document_height_mm > length + 0.5))
+        })
+    {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "document exceeds loaded media; set fit=true",
+        ));
+    }
+    let target_dpi = request.dpi.unwrap_or(printer.dpi);
+    let loaded_box = loaded_media.as_ref().and_then(|media| {
+        let width = media.get("widthMm")?.as_f64()?;
+        let height = media.get("lengthMm")?.as_f64()?;
+        if width <= 0.0 || height <= 0.0 || document.media.continuous {
+            return None;
+        }
+        Some((
+            (width * f64::from(target_dpi) / 25.4).round() as u32,
+            (height * f64::from(target_dpi) / 25.4).round() as u32,
+        ))
+    });
+    let packed = api_render_for_printer(
+        &document,
+        &printer,
+        target_dpi,
+        request.rotation,
+        request.fit,
+        loaded_box,
+    )?;
     let plan = protocol::plan(
         &printer,
         &packed,
@@ -1200,6 +1451,8 @@ async fn submit_job(
     )
     .map_err(|_| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "protocol plan failed"))?;
     let mut job = Job::new();
+    job.idempotency_key = scoped_key;
+    job.request_hash = idempotency_key.map(|_| request_hash);
     job.protocol = Some(format!("{:?}", printer.protocol).to_ascii_lowercase());
     job.action_count = plan.actions.len();
     job.total_bytes = plan
@@ -1212,13 +1465,41 @@ async fn submit_job(
         })
         .sum();
     job.resumable = Some(
-        serde_json::json!({"model":model,"connectionId":request.connection_id,"transport":request.transport,"document":request.document,"dpi":request.dpi,"density":request.density,"copies":request.copies,"payloadLimit":request.payload_limit}),
+        serde_json::json!({"model":model,"connectionId":request.connection_id,"transport":request.transport,"document":request.document,"dpi":request.dpi,"rotation":request.rotation,"fit":request.fit,"density":request.density,"copies":request.copies,"payloadLimit":request.payload_limit}),
     );
     let (events, _) = broadcast::channel(32);
     let cancel = Arc::new(AtomicBool::new(false));
     let id = job.id;
     {
         let mut jobs = state.jobs.write().await;
+        if let Some(key) = &job.idempotency_key
+            && let Some(existing) = jobs
+                .values()
+                .find(|existing| existing.idempotency_key.as_ref() == Some(key))
+        {
+            if existing.request_hash != job.request_hash {
+                return Err(ApiError(
+                    StatusCode::CONFLICT,
+                    "idempotency key was used for a different request",
+                ));
+            }
+            return Ok((StatusCode::OK, Json(JobView::from(existing))));
+        }
+        if jobs.len() >= state.config.max_recent_jobs {
+            let removable = jobs
+                .values()
+                .filter(|job| job.terminal())
+                .min_by_key(|job| (job.updated_at_ms, job.id))
+                .map(|job| job.id);
+            if let Some(old_id) = removable {
+                jobs.remove(&old_id);
+            } else {
+                return Err(ApiError(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "all retained jobs are active",
+                ));
+            }
+        }
         jobs.insert(id, job.clone());
         save_jobs(&state, &jobs)?;
     }
@@ -1455,6 +1736,9 @@ struct LaposteRequest {
     dpi: u16,
     #[serde(default)]
     pages: Vec<u32>,
+    /// Optional one-based `page:slot` selectors applied after occupancy detection.
+    #[serde(default)]
+    slots: Vec<String>,
 }
 const fn laposte_dpi() -> u16 {
     300
@@ -1476,13 +1760,17 @@ async fn laposte_extract(
         .format
         .parse()
         .map_err(|_| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "unknown La Poste format"))?;
-    let stamps = crate::laposte::extract_bytes(bytes, format, request.dpi, &request.pages)
+    let mut stamps = crate::laposte::extract_bytes(bytes, format, request.dpi, &request.pages)
         .map_err(|_| {
             ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "La Poste extraction failed",
             )
         })?;
+    if !request.slots.is_empty() {
+        let selectors = parse_slot_selectors(&request.slots)?;
+        stamps.retain(|stamp| selectors.contains(&(stamp.page, stamp.slot)));
+    }
     if stamps.is_empty() {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1492,6 +1780,37 @@ async fn laposte_extract(
     Ok(Json(
         serde_json::json!({"stamps":stamps.iter().map(|stamp|serde_json::json!({"page":stamp.page,"slot":stamp.slot,"widthUm":stamp.width_um,"heightUm":stamp.height_um,"raster":{"width":stamp.raster.width,"height":stamp.raster.height,"pixelsBase64":base64::engine::general_purpose::STANDARD.encode(&stamp.raster.pixels)}})).collect::<Vec<_>>() }),
     ))
+}
+
+fn parse_slot_selectors(
+    values: &[String],
+) -> Result<std::collections::HashSet<(u32, u16)>, ApiError> {
+    values
+        .iter()
+        .map(|value| {
+            let (page, slot) = value.split_once(':').ok_or(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "slot selector must be page:slot",
+            ))?;
+            let page = page
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "slot selector must be page:slot",
+                ))?;
+            let slot = slot
+                .parse::<u16>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "slot selector must be page:slot",
+                ))?;
+            Ok((page, slot))
+        })
+        .collect()
 }
 
 pub fn router(state: ApiState) -> Router {
@@ -1504,10 +1823,17 @@ pub fn router(state: ApiState) -> Router {
                 .is_ok_and(|origin| allowed_origins.iter().any(|allowed| allowed == origin))
         }))
         .allow_methods([http::Method::GET, http::Method::POST, http::Method::OPTIONS])
-        .allow_headers([http::header::AUTHORIZATION, http::header::CONTENT_TYPE])
+        .allow_headers([
+            http::header::AUTHORIZATION,
+            http::header::CONTENT_TYPE,
+            http::HeaderName::from_static("idempotency-key"),
+        ])
         .allow_private_network(true);
     Router::new()
         .route("/v1/pair", post(pair))
+        .route("/v1/grants/me", get(current_grant))
+        .route("/v1/grants/me/rotate", post(rotate_current_grant))
+        .route("/v1/grants/me/revoke", post(revoke_current_grant))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/printers", get(printers))
         .route("/v1/discovery", post(discovery))
@@ -1548,6 +1874,24 @@ pub async fn serve(
     Ok(())
 }
 
+/// Serve IPv4 and IPv6 loopback concurrently. Binding either listener must
+/// succeed so callers never unknowingly lose one browser loopback path.
+pub async fn serve_dual(port: u16, state: ApiState) -> Result<(), Box<dyn std::error::Error>> {
+    use std::future::IntoFuture as _;
+    let ipv4 = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+    let ipv6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await?;
+    let v4 = axum::serve(ipv4, router(state.clone())).into_future();
+    let v6 = axum::serve(ipv6, router(state)).into_future();
+    tokio::pin!(v4);
+    tokio::pin!(v6);
+    tokio::select! {
+        result = &mut v4 => result?,
+        result = &mut v6 => result?,
+        _ = tokio::signal::ctrl_c() => {},
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1556,6 +1900,9 @@ mod tests {
     use tower::ServiceExt;
     fn test_state() -> ApiState {
         let dir = tempfile::tempdir().unwrap().keep();
+        test_state_at(&dir)
+    }
+    fn test_state_at(dir: &std::path::Path) -> ApiState {
         ApiState::new(
             AuthStore::load(dir.join("g.json")).unwrap(),
             Config {
@@ -1566,6 +1913,55 @@ mod tests {
                 ..Config::default()
             },
         )
+    }
+    async fn test_token(state: &ApiState) -> String {
+        let secret = state
+            .auth
+            .write()
+            .await
+            .begin_pairing(Duration::from_secs(30))
+            .unwrap()
+            .value;
+        state
+            .auth
+            .write()
+            .await
+            .exchange(&secret, "https://editor.example", Duration::from_secs(300))
+            .unwrap()
+            .unwrap()
+            .1
+    }
+    #[tokio::test]
+    async fn idempotency_replays_same_persisted_job_after_restart() {
+        use http_body_util::BodyExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state_at(directory.path());
+        let token = test_token(&state).await;
+        let request = || {
+            Request::post("/v1/jobs")
+                .header("host", "localhost:9847")
+                .header("origin", "https://editor.example")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("idempotency-key", "restart-safe")
+                .body(Body::from(include_str!(
+                    "../tests/fixtures/editor-job.json"
+                )))
+                .unwrap()
+        };
+        let response = router(state).oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let first: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let restarted = test_state_at(directory.path());
+        let response = router(restarted).oneshot(request()).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let replay: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(first["id"], replay["id"]);
     }
     #[tokio::test]
     async fn rejects_non_loopback_host_before_pairing() {
@@ -1604,7 +2000,7 @@ mod tests {
             .header("access-control-request-method", "POST")
             .header(
                 "access-control-request-headers",
-                "authorization,content-type",
+                "authorization,content-type,idempotency-key",
             )
             .header("access-control-request-private-network", "true")
             .body(Body::empty())
@@ -1618,6 +2014,13 @@ mod tests {
         assert_eq!(
             response.headers()["access-control-allow-private-network"],
             "true"
+        );
+        assert!(
+            response.headers()["access-control-allow-headers"]
+                .to_str()
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("idempotency-key")
         );
         assert!(
             response.headers()["vary"]
@@ -1772,6 +2175,42 @@ mod tests {
         assert_eq!(finished["terminal"], true);
         assert!(finished["bytesSent"].as_u64().unwrap() > 0);
 
+        let idempotent_body = include_str!("../tests/fixtures/editor-job.json");
+        let submit = || {
+            Request::post("/v1/jobs")
+                .header("host", "localhost:9847")
+                .header("origin", "https://editor.example")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .header("idempotency-key", "editor-submit-42")
+                .body(Body::from(idempotent_body))
+                .unwrap()
+        };
+        let first = app.clone().oneshot(submit()).await.unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first: serde_json::Value =
+            serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        let replay = app.clone().oneshot(submit()).await.unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay: serde_json::Value =
+            serde_json::from_slice(&replay.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(first["id"], replay["id"]);
+        let mut conflicting: serde_json::Value = serde_json::from_str(idempotent_body).unwrap();
+        conflicting["density"] = serde_json::json!(2);
+        let conflict = Request::post("/v1/jobs")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .header("idempotency-key", "editor-submit-42")
+            .body(Body::from(conflicting.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(conflict).await.unwrap().status(),
+            StatusCode::CONFLICT
+        );
+
         let request = Request::post("/v1/connection")
             .header("host", "localhost:9847")
             .header("origin", "https://editor.example")
@@ -1826,10 +2265,44 @@ mod tests {
                 .body(Body::from(unavailable.to_string()))
                 .unwrap();
             assert_eq!(
-                app.oneshot(request).await.unwrap().status(),
+                app.clone().oneshot(request).await.unwrap().status(),
                 StatusCode::UNPROCESSABLE_ENTITY
             );
         }
+
+        let rotate = Request::post("/v1/grants/me/rotate")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"expiresSeconds":120}"#))
+            .unwrap();
+        let response = app.clone().oneshot(rotate).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let rotated: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let replacement = rotated["token"].as_str().unwrap();
+        let old = Request::get("/v1/grants/me")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(old).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let revoke = Request::post("/v1/grants/me/revoke")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("authorization", format!("Bearer {replacement}"))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(revoke).await.unwrap().status(),
+            StatusCode::NO_CONTENT
+        );
     }
     #[test]
     fn cancellation_at_first_write_uses_conservative_ambiguous_outcome() {
@@ -1891,6 +2364,34 @@ mod tests {
         let progress = error.1.unwrap();
         assert!(progress.potentially_accepted_write);
         assert_eq!(progress.bytes_written, 0);
+    }
+    #[test]
+    fn api_rotation_and_fit_are_explicit_and_preflight_head_width() {
+        let mut document =
+            Document::from_json(include_str!("../tests/fixtures/canonical-document.json")).unwrap();
+        let printer = capabilities::by_id("m110").unwrap();
+        let normal = api_render_for_printer(&document, &printer, 203, 0, false, None).unwrap();
+        let rotated = api_render_for_printer(&document, &printer, 203, 90, false, None).unwrap();
+        assert_ne!(normal.height, rotated.height);
+        document.media.width = 100_000;
+        assert!(api_render_for_printer(&document, &printer, 203, 0, false, None).is_err());
+        let fitted = api_render_for_printer(&document, &printer, 203, 0, true, None).unwrap();
+        assert_eq!(
+            u32::from(fitted.width_bytes) * 8,
+            printer.width_px().unwrap()
+        );
+        assert!(api_render_for_printer(&document, &printer, 203, 45, true, None).is_err());
+        let media_fitted =
+            api_render_for_printer(&document, &printer, 203, 0, true, Some((384, 200))).unwrap();
+        assert_eq!(media_fitted.height, 200);
+    }
+    #[test]
+    fn laposte_slot_selectors_are_one_based_and_stable() {
+        let selectors = parse_slot_selectors(&["1:4".into(), "3:12".into()]).unwrap();
+        assert!(selectors.contains(&(1, 4)));
+        assert!(selectors.contains(&(3, 12)));
+        assert!(parse_slot_selectors(&["0:1".into()]).is_err());
+        assert!(parse_slot_selectors(&["1".into()]).is_err());
     }
     #[tokio::test(flavor = "multi_thread")]
     async fn selected_brother_tcp_status_reports_live_media() {

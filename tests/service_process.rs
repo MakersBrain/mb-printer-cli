@@ -51,6 +51,20 @@ fn request(
         .to_owned();
     (status, text, body)
 }
+fn ipv6_status(port: u16, host: &str, token: &str) -> u16 {
+    let mut stream = TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    write!(
+        stream,
+        "GET /v1/capabilities HTTP/1.1\r\nHost: {host}\r\nOrigin: https://editor.example\r\nAuthorization: Bearer {token}\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = String::new();
+    stream.read_to_string(&mut response).unwrap();
+    response.split_whitespace().nth(1).unwrap().parse().unwrap()
+}
 // Every returned child is killed and waited below; Clippy cannot follow that
 // ownership across this test helper boundary.
 #[allow(clippy::zombie_processes)]
@@ -70,6 +84,10 @@ fn start(binary: &str, config: &Path, port: u16) -> Child {
         .unwrap();
     for _ in 0..100 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            assert!(
+                TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).is_ok(),
+                "default service must bind IPv6 loopback with IPv4"
+            );
             return child;
         }
         thread::sleep(Duration::from_millis(10));
@@ -134,6 +152,8 @@ fn external_service_security_restart_and_job_contract() {
     let pair = exchange(port, &secret);
     let token = pair["token"].as_str().unwrap();
     let grant = pair["grantId"].as_str().unwrap();
+    assert_eq!(ipv6_status(port, &format!("[::1]:{port}"), token), 200);
+    assert_eq!(ipv6_status(port, "evil.example", token), 421);
     let (preflight, headers, _) = request(
         port,
         "OPTIONS",

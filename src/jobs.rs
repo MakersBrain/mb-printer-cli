@@ -28,6 +28,12 @@ pub struct Job {
     pub error: Option<String>,
     #[serde(default)]
     pub resumable: Option<serde_json::Value>,
+    /// Origin-scoped HTTP idempotency key used to deduplicate submissions.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// SHA-256 of the exact request body associated with the idempotency key.
+    #[serde(default)]
+    pub request_hash: Option<String>,
     #[serde(default)]
     pub created_at_ms: u128,
     #[serde(default)]
@@ -51,6 +57,8 @@ impl Job {
             action_count: 0,
             error: None,
             resumable: None,
+            idempotency_key: None,
+            request_hash: None,
             created_at_ms: now,
             updated_at_ms: now,
         }

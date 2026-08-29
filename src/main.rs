@@ -467,6 +467,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             let dpi = options.dpi.unwrap_or(printer.dpi);
             let stamps =
                 laposte::extract_pdf(&args.input, args.laposte_format, dpi, &options.page)?;
+            let stamps = select_laposte_slots(stamps, &args.slots)?;
             if stamps.is_empty() {
                 return Err("La Poste sheet contains no occupied stamps".into());
             }
@@ -487,6 +488,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             laposte::validate_a4(&args.input, &args.page)?;
             let stamps =
                 laposte::extract_pdf(&args.input, args.laposte_format, args.dpi, &args.page)?;
+            let stamps = select_laposte_slots(stamps, &args.slots)?;
+            if stamps.is_empty() {
+                return Err("La Poste selection contains no occupied stamps".into());
+            }
             fs::write(&args.output, laposte::export_stamps_pdf(&stamps, args.dpi)?)?;
             println!(
                 "{} ({} occupied stamps)",
@@ -651,12 +656,41 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         return Err("configure allowed_origins before serving the API".into());
                     }
                     let state = ApiState::new(AuthStore::load(store_path)?, cfg);
-                    api::serve(bind, port, state).await?;
+                    if let Some(bind) = bind {
+                        api::serve(bind, port, state).await?;
+                    } else {
+                        api::serve_dual(port, state).await?;
+                    }
                 }
             }
         }
     }
     Ok(())
+}
+
+fn select_laposte_slots(
+    mut stamps: Vec<mb_printer_core::laposte::Stamp>,
+    values: &[String],
+) -> Result<Vec<mb_printer_core::laposte::Stamp>, Box<dyn std::error::Error>> {
+    if values.is_empty() {
+        return Ok(stamps);
+    }
+    let selectors = values
+        .iter()
+        .map(|value| {
+            let (page, slot) = value
+                .split_once(':')
+                .ok_or("slot selector must be page:slot")?;
+            let page = page.parse::<u32>()?;
+            let slot = slot.parse::<u16>()?;
+            if page == 0 || slot == 0 {
+                return Err("slot selector values are one-based".into());
+            }
+            Ok((page, slot))
+        })
+        .collect::<Result<std::collections::HashSet<_>, Box<dyn std::error::Error>>>()?;
+    stamps.retain(|stamp| selectors.contains(&(stamp.page, stamp.slot)));
+    Ok(stamps)
 }
 
 fn validate_document(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
