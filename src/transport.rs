@@ -363,9 +363,9 @@ pub mod bluetooth {
 #[cfg(feature = "usb")]
 pub mod usb {
     use super::*;
-    use rusb::{DeviceHandle, GlobalContext};
+    use rusb::{DeviceHandle, UsbContext as _};
     pub struct UsbTransport {
-        handle: DeviceHandle<GlobalContext>,
+        handle: DeviceHandle<rusb::Context>,
         out: u8,
         input: Option<u8>,
         payload_limit: usize,
@@ -380,11 +380,34 @@ pub mod usb {
             input: Option<u8>,
             payload_limit: usize,
         ) -> io::Result<Self> {
-            let handle = rusb::open_device_with_vid_pid(vid, pid)
+            let context = rusb::Context::new().map_err(io::Error::other)?;
+            let devices = context.devices().map_err(io::Error::other)?;
+            let device = devices
+                .iter()
+                .find(|device| {
+                    device.device_descriptor().is_ok_and(|descriptor| {
+                        descriptor.vendor_id() == vid && descriptor.product_id() == pid
+                    })
+                })
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "USB device not found"))?;
+            let handle = device.open().map_err(io::Error::other)?;
+            let _ = handle.set_auto_detach_kernel_driver(true);
             handle
                 .claim_interface(interface)
                 .map_err(io::Error::other)?;
+            // Match the Python transport: a status block can outlive the
+            // process which requested it, so discard stale replies before a
+            // new job. A timeout means the endpoint is clean.
+            if let Some(endpoint) = input {
+                let mut stale = [0_u8; 64];
+                for _ in 0..8 {
+                    match handle.read_bulk(endpoint, &mut stale, Duration::from_millis(50)) {
+                        Ok(0) | Err(rusb::Error::Timeout) => break,
+                        Ok(_) => {}
+                        Err(error) => return Err(io::Error::other(error)),
+                    }
+                }
+            }
             Ok(Self {
                 handle,
                 out,
@@ -414,22 +437,30 @@ pub mod usb {
             let Some(endpoint) = self.input else {
                 return Ok(WaitOutcome::Unavailable);
             };
-            let mut b = vec![0; 4096];
-            match self
-                .handle
-                .read_bulk(endpoint, &mut b, Duration::from_millis(timeout))
-            {
-                Ok(n) => {
-                    b.truncate(n);
-                    Ok(WaitOutcome::Response(b))
+            let deadline = std::time::Instant::now() + Duration::from_millis(timeout);
+            let mut b = vec![0; 64];
+            loop {
+                let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+                else {
+                    return Ok(WaitOutcome::Timeout);
+                };
+                match self.handle.read_bulk(endpoint, &mut b, remaining) {
+                    // QL printers can return zero-length USB packets while a
+                    // status reply is being prepared; keep polling.
+                    Ok(0) => continue,
+                    Ok(n) => {
+                        b.truncate(n);
+                        return Ok(WaitOutcome::Response(b));
+                    }
+                    Err(rusb::Error::Timeout) => return Ok(WaitOutcome::Timeout),
+                    Err(e) => return Err(e.to_string()),
                 }
-                Err(rusb::Error::Timeout) => Ok(WaitOutcome::Timeout),
-                Err(e) => Err(e.to_string()),
             }
         }
     }
     pub fn discover() -> io::Result<Vec<NativeDevice>> {
-        let devices = rusb::devices().map_err(io::Error::other)?;
+        let context = rusb::Context::new().map_err(io::Error::other)?;
+        let devices = context.devices().map_err(io::Error::other)?;
         let mut out = Vec::new();
         for device in devices.iter() {
             let descriptor = device.device_descriptor().map_err(io::Error::other)?;
@@ -466,8 +497,8 @@ pub mod usb {
     }
 
     fn read_ieee1284_device_id(
-        device: &rusb::Device<GlobalContext>,
-        handle: &DeviceHandle<GlobalContext>,
+        device: &rusb::Device<rusb::Context>,
+        handle: &DeviceHandle<rusb::Context>,
         timeout: Duration,
     ) -> io::Result<Option<String>> {
         let config = device

@@ -1011,7 +1011,7 @@ const fn default_copies() -> u16 {
     1
 }
 const fn default_payload() -> usize {
-    128
+    512
 }
 struct Cancellable<T> {
     inner: T,
@@ -1676,7 +1676,13 @@ mod tests {
         let response = app.clone().oneshot(request).await.unwrap();
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(listing["printers"]["discovered"][0]["matchedModel"], "m110");
+        let injected = listing["printers"]["discovered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|printer| printer["device"]["address"] == "/dev/mock-m110")
+            .expect("injected M110 fixture should be discovered");
+        assert_eq!(injected["matchedModel"], "m110");
         for (format, content_type, magic) in [
             ("png", "image/png", b"\x89PNG".as_slice()),
             ("pdf", "application/pdf", b"%PDF".as_slice()),

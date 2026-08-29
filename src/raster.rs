@@ -140,6 +140,48 @@ pub fn scale_to_width(image: &MonoRaster, width: u32) -> io::Result<MonoRaster> 
     })
 }
 
+/// Scale proportionally into a fixed printable box and centre on white.
+/// Brother die-cut media defines this box independently of the physical label.
+pub fn fit_to_box(image: &MonoRaster, width: u32, height: u32) -> io::Result<MonoRaster> {
+    if width == 0 || height == 0 || image.width == 0 || image.height == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid raster dimensions",
+        ));
+    }
+    let scale_by_width =
+        u64::from(width) * u64::from(image.height) <= u64::from(height) * u64::from(image.width);
+    let (scaled_width, scaled_height) = if scale_by_width {
+        (
+            width,
+            ((u64::from(image.height) * u64::from(width) + u64::from(image.width) / 2)
+                / u64::from(image.width)) as u32,
+        )
+    } else {
+        (
+            ((u64::from(image.width) * u64::from(height) + u64::from(image.height) / 2)
+                / u64::from(image.height)) as u32,
+            height,
+        )
+    };
+    let scaled = scale_to_width(image, scaled_width.max(1))?;
+    debug_assert_eq!(scaled.height, scaled_height.max(1));
+    let mut pixels = vec![0_u8; (width * height) as usize];
+    let left = (width - scaled.width) / 2;
+    let top = (height - scaled.height) / 2;
+    for y in 0..scaled.height {
+        let source = (y * scaled.width) as usize;
+        let destination = ((top + y) * width + left) as usize;
+        pixels[destination..destination + scaled.width as usize]
+            .copy_from_slice(&scaled.pixels[source..source + scaled.width as usize]);
+    }
+    Ok(MonoRaster {
+        width,
+        height,
+        pixels,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn sheet_pdf(
     label: &MonoRaster,
@@ -273,6 +315,21 @@ mod tests {
         assert_eq!(scale_to_width(&raster, 4).unwrap().height, 2);
         let pdf = sheet_pdf(&raster, 203, "a4", 5.0, 2.0, 2, 2, true).unwrap();
         assert!(String::from_utf8_lossy(&pdf).contains("/MediaBox [0 0 595.275591 841.889764]"));
+    }
+
+    #[test]
+    fn brother_die_cut_artwork_fits_and_centres_in_printable_box() {
+        let raster = MonoRaster {
+            width: 620,
+            height: 290,
+            pixels: vec![1; 620 * 290],
+        };
+        let fitted = fit_to_box(&raster, 696, 271).unwrap();
+        assert_eq!((fitted.width, fitted.height), (696, 271));
+        let ink = fitted.pixels.iter().filter(|pixel| **pixel != 0).count();
+        assert_eq!(ink, 579 * 271);
+        assert!(fitted.pixels[..58].iter().all(|pixel| *pixel == 0));
+        assert_eq!(fitted.pixels[58], 1);
     }
 
     #[test]

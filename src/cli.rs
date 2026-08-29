@@ -210,7 +210,7 @@ pub struct PrintOptions {
     /// Transport URI: file:/path, tcp://host:port, or serial:/dev/ttyUSB0.
     #[arg(long)]
     pub transport: Option<String>,
-    #[arg(long, default_value_t = 128)]
+    #[arg(long, default_value_t = 512)]
     pub payload_limit: usize,
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(1..=8))]
     pub density: u8,

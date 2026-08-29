@@ -9,7 +9,9 @@ use mb_printer_cli::{
         WifiCommand,
     },
     config, laposte, raster,
-    transport::{self, CaptureTransport, SerialTransport, TcpTransport, WriteTransport},
+    transport::{
+        self, CaptureTransport, PhysicalEvent, SerialTransport, TcpTransport, WriteTransport,
+    },
 };
 use mb_printer_core::{
     Document, capabilities,
@@ -914,7 +916,7 @@ fn apply_config_defaults(
     if options.baud == 115_200 {
         options.baud = defaults.baud.unwrap_or(options.baud);
     }
-    if options.payload_limit == 128 {
+    if options.payload_limit == 512 {
         options.payload_limit = defaults.payload_limit.unwrap_or(options.payload_limit);
     }
     if options.data.is_empty() {
@@ -942,7 +944,21 @@ fn plan_document(
         options.dpi.unwrap_or(printer.dpi),
         options.dither.as_deref(),
     )?;
-    mono = transform_for_printer(mono, &printer, options)?;
+    let brother_62x29 = printer.protocol == mb_printer_core::capabilities::Protocol::Brother && {
+        let width = document.media.width;
+        let height = document.media.height;
+        (width.abs_diff(62_000) <= 1_500 && height.abs_diff(29_000) <= 1_500)
+            || (width.abs_diff(29_000) <= 1_500 && height.abs_diff(62_000) <= 1_500)
+    };
+    if brother_62x29 {
+        use mb_printer_core::raster::Fit;
+        // Brother's DK-11209/62x29 table: a 696x271 printable rectangle,
+        // positioned 12 + 44 dots from the right edge on wide QL heads.
+        mono = raster::fit_to_box(&mono, 696, 271)?;
+        mono = mono.place_on_head(1296, Fit::Right, -56, 0)?;
+    } else {
+        mono = transform_for_printer(mono, &printer, options)?;
+    }
     let head = printer
         .width_px()
         .ok_or("printer has media-dependent head width")?;
@@ -950,6 +966,29 @@ fn plan_document(
         width_bytes: head.div_ceil(8) as u16,
         height: mono.height,
         data: mono.pack_msb()?,
+    };
+    let brother_media = if printer.protocol == mb_printer_core::capabilities::Protocol::Brother {
+        let millimetres = |value: i64| -> Result<u8, Box<dyn std::error::Error>> {
+            Ok(u8::try_from(value.saturating_add(500) / 1000)?)
+        };
+        Some(mb_printer_core::protocol::BrotherMedia {
+            width_mm: if brother_62x29 {
+                62
+            } else {
+                millimetres(document.media.width)?
+            },
+            length_mm: if document.media.continuous || options.continuous {
+                0
+            } else if brother_62x29 {
+                29
+            } else {
+                millimetres(document.media.height)?
+            },
+            continuous: document.media.continuous || options.continuous,
+            feed_margin: 0,
+        })
+    } else {
+        None
     };
     let protocol_options = Options {
         density: options.density,
@@ -966,6 +1005,7 @@ fn plan_document(
         offset_y: options.offset_y,
         label_width_tenths_mm: u16::try_from(document.media.width / 100).ok(),
         label_height_tenths_mm: u16::try_from(document.media.height / 100).ok(),
+        brother_media,
         cut: !options.no_cut,
         cut_every: options.cut_every.unwrap_or(Options::default().cut_every),
         compress: !options.no_compress,
@@ -1113,10 +1153,20 @@ async fn execute_plan(
     let progress = if let Some(path) = uri.strip_prefix("file:") {
         let mut target = WriteTransport::file(Path::new(path), options.payload_limit)?;
         mb_printer_native::execute(plan, &mut target)?
+    } else if let Some(address) = uri.strip_prefix("ipp://") {
+        execute_ipp_plan(plan, address, options.payload_limit)?
     } else if let Some(address) = uri.strip_prefix("tcp://") {
-        let mut target =
-            TcpTransport::connect(address, options.payload_limit, Duration::from_secs(5))?;
-        mb_printer_native::execute(plan, &mut target)?
+        if plan.protocol == mb_printer_core::capabilities::Protocol::Brother
+            && address
+                .rsplit_once(':')
+                .is_some_and(|(_, port)| port == "631")
+        {
+            execute_ipp_plan(plan, address, options.payload_limit)?
+        } else {
+            let mut target =
+                TcpTransport::connect(address, options.payload_limit, Duration::from_secs(5))?;
+            mb_printer_native::execute(plan, &mut target)?
+        }
     } else if let Some(path) = uri.strip_prefix("serial:") {
         let mut target =
             SerialTransport::open(Path::new(path), options.baud, options.payload_limit)?;
@@ -1183,13 +1233,72 @@ async fn execute_plan(
             return Err("USB support requires the usb Cargo feature".into());
         }
     } else {
-        return Err("transport must use file:, tcp://, serial:, ble:, or usb:".into());
+        return Err(
+            "transport must use file:, tcp://, ipp://, serial:, rfcomm:, ble:, or usb:".into(),
+        );
     };
     eprintln!(
         "completed: {} bytes, last action {:?}",
         progress.bytes_written, progress.last_completed_action
     );
     Ok(())
+}
+
+fn execute_ipp_plan(
+    plan: &Plan,
+    address: &str,
+    payload_limit: usize,
+) -> Result<mb_printer_native::Progress, Box<dyn std::error::Error>> {
+    if plan.protocol != mb_printer_core::capabilities::Protocol::Brother {
+        return Err("IPP octet-stream printing currently requires a Brother raster plan".into());
+    }
+    let (host, port) = match address.rsplit_once(':') {
+        Some((host, port)) => (host, port.parse()?),
+        None => (address, 631),
+    };
+    let attributes = mb_printer_cli::device::ipp_query(host, port, Duration::from_secs(5))?;
+    let media = attributes
+        .get("media-ready")
+        .and_then(|values| values.first())
+        .and_then(|value| match value {
+            mb_printer_cli::device::IppValue::Text(value) => Some(value.as_str()),
+            mb_printer_cli::device::IppValue::Integer(_) => None,
+        })
+        .ok_or("IPP printer did not report loaded media")?;
+    let mut capture = CaptureTransport::new(payload_limit);
+    let mut response = vec![0; 32];
+    response[..3].copy_from_slice(&[0x80, 0x20, 0x42]);
+    capture.response = Some(response);
+    let progress = mb_printer_native::execute(plan, &mut capture)?;
+    let document = capture
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            PhysicalEvent::Write { bytes } => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    let result = mb_printer_cli::device::ipp_print_job(
+        host,
+        port,
+        &document,
+        media,
+        Duration::from_secs(15),
+    )?;
+    let job_id = result
+        .get("job-id")
+        .and_then(|values| values.first())
+        .and_then(|value| match value {
+            mb_printer_cli::device::IppValue::Integer(value) => Some(*value),
+            mb_printer_cli::device::IppValue::Text(_) => None,
+        });
+    eprintln!(
+        "IPP job accepted: {}",
+        job_id.map_or_else(|| "unknown".into(), |id| id.to_string())
+    );
+    Ok(progress)
 }
 
 #[cfg(all(feature = "bluetooth", target_os = "linux"))]

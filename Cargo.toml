@@ -17,7 +17,7 @@ include = ["src/**", "tests/**", "docs/**", ".github/**", "Cargo.toml", "Cargo.l
 [features]
 default = []
 usb = ["dep:rusb"]
-bluetooth = ["dep:btleplug", "mb-printer-native/bluetooth-rfcomm"]
+bluetooth = ["dep:btleplug", "mb-printer-native/ble", "mb-printer-native/bluetooth-rfcomm"]
 
 [[bin]]
 name = "mb-printer"

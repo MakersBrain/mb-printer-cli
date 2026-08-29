@@ -400,7 +400,33 @@ pub fn ipp_query(
     )?;
     stream.write_all(&body)?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response)?;
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(length) => {
+                response.extend_from_slice(&chunk[..length]);
+                if response.len() > 1024 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "IPP HTTP response exceeds 1 MiB",
+                    ));
+                }
+                if http_content_complete(&response) {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) && http_content_complete(&response) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
     let split = response
         .windows(4)
         .position(|part| part == b"\r\n\r\n")
@@ -412,6 +438,110 @@ pub fn ipp_query(
         return Err(std::io::Error::other("IPP HTTP request failed"));
     }
     Ok(parse_ipp(&response[split..]))
+}
+
+/// Submit an already encoded printer-language document through IPP Print-Job.
+/// Brother QL network models advertise `application/octet-stream` for this path.
+pub fn ipp_print_job(
+    host: &str,
+    port: u16,
+    document: &[u8],
+    media: &str,
+    timeout: Duration,
+) -> std::io::Result<BTreeMap<String, Vec<IppValue>>> {
+    let address = (host, port).to_socket_addrs()?.next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "IPP host did not resolve")
+    })?;
+    let uri = format!("ipp://{host}:{port}/ipp/print");
+    let mut body = vec![2, 0, 0, 2, 0, 0, 0, 1, 1];
+    body.extend(ipp_attr(0x47, "attributes-charset", "utf-8"));
+    body.extend(ipp_attr(0x48, "attributes-natural-language", "en"));
+    body.extend(ipp_attr(0x45, "printer-uri", &uri));
+    body.extend(ipp_attr(0x42, "requesting-user-name", "mb-printer"));
+    body.extend(ipp_attr(0x42, "job-name", "mb-printer-label"));
+    body.extend(ipp_attr(
+        0x49,
+        "document-format",
+        "application/octet-stream",
+    ));
+    body.push(2); // job-attributes-tag
+    body.extend(ipp_attr(0x44, "media", media));
+    body.push(0x21); // integer
+    body.extend(("copies".len() as u16).to_be_bytes());
+    body.extend(b"copies");
+    body.extend(4_u16.to_be_bytes());
+    body.extend(1_i32.to_be_bytes());
+    body.push(3);
+    body.extend(document);
+
+    let mut stream = TcpStream::connect_timeout(&address, timeout)?;
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
+    write!(
+        stream,
+        "POST /ipp/print HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/ipp\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(&body)?;
+    let mut response = Vec::new();
+    let mut chunk = [0_u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(length) => {
+                response.extend_from_slice(&chunk[..length]);
+                if response.len() > 1024 * 1024 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "IPP HTTP response exceeds 1 MiB",
+                    ));
+                }
+                if http_content_complete(&response) {
+                    break;
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) && http_content_complete(&response) =>
+            {
+                break;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    let split = response
+        .windows(4)
+        .position(|part| part == b"\r\n\r\n")
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid IPP HTTP response")
+        })?
+        + 4;
+    if !response.starts_with(b"HTTP/1.1 200") && !response.starts_with(b"HTTP/1.0 200") {
+        return Err(std::io::Error::other("IPP HTTP request failed"));
+    }
+    let ipp = &response[split..];
+    if ipp.len() < 8 || u16::from_be_bytes([ipp[2], ipp[3]]) > 0x00ff {
+        return Err(std::io::Error::other("IPP Print-Job was rejected"));
+    }
+    Ok(parse_ipp(ipp))
+}
+fn http_content_complete(response: &[u8]) -> bool {
+    let Some(split) = response.windows(4).position(|part| part == b"\r\n\r\n") else {
+        return false;
+    };
+    let header_end = split + 4;
+    let headers = String::from_utf8_lossy(&response[..split]);
+    let Some(length) = headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse::<usize>().ok())
+            .flatten()
+    }) else {
+        return false;
+    };
+    response.len() >= header_end.saturating_add(length)
 }
 pub fn ipp_media_size(keyword: &str) -> Option<(u16, u16)> {
     keyword.split('_').rev().find_map(|part| {
@@ -540,17 +670,75 @@ mod tests {
             body.push(3);
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: Keep-Alive\r\n\r\n",
                 body.len()
             )
             .unwrap();
             stream.write_all(&body).unwrap();
+            std::thread::sleep(Duration::from_millis(150));
         });
-        let attributes = ipp_query("127.0.0.1", address.port(), Duration::from_secs(1)).unwrap();
+        let attributes = ipp_query("127.0.0.1", address.port(), Duration::from_millis(50)).unwrap();
         server.join().unwrap();
         assert_eq!(
             attributes["media-ready"],
             vec![IppValue::Text("roll_current_62x0mm".into())]
         );
+    }
+
+    #[test]
+    fn ipp_print_job_submits_raw_brother_data_with_media() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let document = b"\x1bia\x01BROTHER-RASTER";
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let header_end = loop {
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(split) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                    break split + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length: ")
+                        .and_then(|value| value.parse::<usize>().ok())
+                })
+                .unwrap();
+            while request.len() < header_end + content_length {
+                let count = stream.read(&mut chunk).unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let body = &request[header_end..header_end + content_length];
+            assert_eq!(&body[..4], &[2, 0, 0, 2]);
+            let media = b"om_label_62x29mm";
+            assert!(body.windows(media.len()).any(|part| part == media));
+            assert!(body.ends_with(document));
+
+            let response = [2, 0, 0, 0, 0, 0, 0, 1, 3];
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                response.len()
+            )
+            .unwrap();
+            stream.write_all(&response).unwrap();
+        });
+        ipp_print_job(
+            "127.0.0.1",
+            address.port(),
+            document,
+            "om_label_62x29mm",
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        server.join().unwrap();
     }
 }
