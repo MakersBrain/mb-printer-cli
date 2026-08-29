@@ -113,7 +113,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         },
         Command::Render(args) | Command::Export(args) => {
             let document = load_document(&args.input)?;
-            let image = raster::render(&document, args.dpi)?;
+            let mut image = raster::render(&document, args.dpi)?;
+            image = raster::preview_transform(
+                &image,
+                args.zoom,
+                args.offset_x_mm * f64::from(args.dpi) / 25.4,
+                args.offset_y_mm * f64::from(args.dpi) / 25.4,
+            )?;
             if let (Some(width), Some(height)) = (args.tile_width, args.tile_height) {
                 for (index, tile) in raster::tiles(&image, width, height)?.iter().enumerate() {
                     let path = args.output.with_extension(format!("{:04}.png", index + 1));
@@ -144,7 +150,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .extension()
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
             {
-                fs::write(&args.output, raster::svg(&image, args.dpi)?)?;
+                fs::write(
+                    &args.output,
+                    raster::svg_document(&document, &image, args.dpi)?,
+                )?;
             } else {
                 raster::save_png(&image, args.dpi, &args.output)?;
             }
@@ -294,12 +303,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     } else if let Some(address) = uri.strip_prefix("tcp://") {
                         TcpTransport::connect(address, command.len(), Duration::from_secs(5))?
                             .write(&command)?;
-                    } else if let Some(path) = uri
-                        .strip_prefix("serial:")
-                        .or_else(|| uri.strip_prefix("rfcomm:"))
-                    {
+                    } else if let Some(path) = uri.strip_prefix("serial:") {
                         SerialTransport::open(Path::new(path), baud, command.len())?
                             .write(&command)?;
+                    } else if let Some(spec) = uri.strip_prefix("rfcomm:") {
+                        #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+                        {
+                            let (address, channel) = parse_rfcomm(spec)?;
+                            let mut target =
+                                mb_printer_native::transports::rfcomm::RfcommTransport::bind(
+                                    0,
+                                    address,
+                                    channel,
+                                    command.len(),
+                                )?;
+                            target.write(&command)?;
+                        }
+                        #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+                        {
+                            let _ = spec;
+                            return Err("RFCOMM requires the bluetooth feature on Linux".into());
+                        }
                     } else {
                         return Err(
                             "Wi-Fi transport must use file:, tcp://, serial:, or rfcomm:".into(),
@@ -449,10 +473,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "connections_path" => cfg.connections_path = Some(value.into()),
                     "jobs_path" => cfg.jobs_path = Some(value.into()),
                     key if key.starts_with("printer_defaults.") => {
-                        cfg.printer_defaults.insert(
-                            key.trim_start_matches("printer_defaults.").to_owned(),
-                            serde_json::Value::String(value),
-                        );
+                        cfg.printer_defaults
+                            .set_text(key.trim_start_matches("printer_defaults."), &value)?;
                     }
                     "allowed_origins" => {
                         cfg.allowed_origins = value
@@ -479,7 +501,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "jobs_path" => cfg.jobs_path = None,
                     key if key.starts_with("printer_defaults.") => {
                         cfg.printer_defaults
-                            .remove(key.trim_start_matches("printer_defaults."));
+                            .unset(key.trim_start_matches("printer_defaults."))?;
                     }
                     _ => return Err(format!("unknown configuration key {key}").into()),
                 }
@@ -500,6 +522,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .map(str::to_owned)
                         .collect();
                 }
+                let mut migrated = serde_json::Map::new();
                 for key in [
                     "model",
                     "transport",
@@ -521,15 +544,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "font_fallback",
                 ] {
                     if let Some(value) = legacy.get(key) {
-                        cfg.printer_defaults.insert(key.into(), value.clone());
+                        migrated.insert(key.into(), value.clone());
                     }
                 }
                 if let Some(data) = legacy.get("data").and_then(serde_json::Value::as_object) {
-                    for (key, value) in data {
-                        cfg.printer_defaults
-                            .insert(format!("data.{key}"), value.clone());
-                    }
+                    migrated.insert("data".into(), serde_json::Value::Object(data.clone()));
                 }
+                cfg.printer_defaults = serde_json::from_value(serde_json::Value::Object(migrated))?;
                 config::save(&config_path, &cfg)?;
                 println!(
                     "migrated supported security/service settings to {}",
@@ -806,19 +827,11 @@ fn apply_config_defaults(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let defaults = &config.printer_defaults;
     if options.model.is_none() {
-        options.model = defaults
-            .get("model")
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_owned)
+        options.model = defaults.model.clone()
     }
     if options.transport.is_none() {
-        let kind = defaults
-            .get("transport")
-            .and_then(serde_json::Value::as_str);
-        let address = defaults
-            .get("address")
-            .or_else(|| defaults.get("device"))
-            .and_then(serde_json::Value::as_str);
+        let kind = defaults.transport.as_deref();
+        let address = defaults.address.as_deref().or(defaults.device.as_deref());
         if let (Some(kind), Some(address)) = (kind, address) {
             options.transport = Some(match kind {
                 "tcp" => format!("tcp://{address}"),
@@ -829,9 +842,55 @@ fn apply_config_defaults(
         }
     }
     if options.density == 6
-        && let Some(value) = defaults.get("density").and_then(serde_json::Value::as_u64)
+        && let Some(value) = defaults.density
     {
-        options.density = u8::try_from(value)?;
+        options.density = value;
+    }
+    if options.dpi.is_none() {
+        options.dpi = defaults.dpi;
+    }
+    if options.feed.is_none() {
+        options.feed = defaults.feed.and_then(|value| u8::try_from(value).ok());
+    }
+    if options.speed.is_none() {
+        options.speed = defaults.speed;
+    }
+    if !options.continuous {
+        options.continuous = defaults.continuous.unwrap_or(false);
+    }
+    if options.align.is_none() {
+        options.align = defaults.align.clone();
+    }
+    if options.offset_x == 0 {
+        options.offset_x = defaults
+            .offset_x
+            .and_then(|value| u16::try_from(value.round() as i64).ok())
+            .unwrap_or(0);
+    }
+    if options.offset_y == 0 {
+        options.offset_y = defaults
+            .offset_y
+            .and_then(|value| u16::try_from(value.round() as i64).ok())
+            .unwrap_or(0);
+    }
+    if options.gap_mm.is_none() {
+        options.gap_mm = defaults.gap_mm;
+    }
+    if options.tspl_offset_mm.is_none() {
+        options.tspl_offset_mm = defaults.tspl_offset_mm;
+    }
+    if options.baud == 115_200 {
+        options.baud = defaults.baud.unwrap_or(options.baud);
+    }
+    if options.payload_limit == 128 {
+        options.payload_limit = defaults.payload_limit.unwrap_or(options.payload_limit);
+    }
+    if options.data.is_empty() {
+        options.data = defaults
+            .data
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
     }
     Ok(())
 }
@@ -858,10 +917,22 @@ fn plan_document(
     };
     let protocol_options = Options {
         density: options.density,
+        feed: options.feed.unwrap_or(Options::default().feed),
+        speed: options.speed.unwrap_or(Options::default().speed),
         copies: options.copies,
-        continuous: document.media.continuous,
+        continuous: options.continuous || document.media.continuous,
+        gap_tenths_mm: millimetres_to_tenths(options.gap_mm, Options::default().gap_tenths_mm)?,
+        offset_tenths_mm: millimetres_to_tenths(
+            options.tspl_offset_mm,
+            Options::default().offset_tenths_mm,
+        )?,
+        offset_x: options.offset_x,
+        offset_y: options.offset_y,
         label_width_tenths_mm: u16::try_from(document.media.width / 100).ok(),
         label_height_tenths_mm: u16::try_from(document.media.height / 100).ok(),
+        cut: !options.no_cut,
+        cut_every: options.cut_every.unwrap_or(Options::default().cut_every),
+        compress: !options.no_compress,
         ..Options::default()
     };
     Ok(protocol::plan(&printer, &packed, &protocol_options)?)
@@ -888,9 +959,22 @@ fn plan_stamp(
         &packed,
         &Options {
             density: options.density,
+            feed: options.feed.unwrap_or(Options::default().feed),
+            speed: options.speed.unwrap_or(Options::default().speed),
             copies: options.copies,
+            continuous: options.continuous,
+            gap_tenths_mm: millimetres_to_tenths(options.gap_mm, Options::default().gap_tenths_mm)?,
+            offset_tenths_mm: millimetres_to_tenths(
+                options.tspl_offset_mm,
+                Options::default().offset_tenths_mm,
+            )?,
+            offset_x: options.offset_x,
+            offset_y: options.offset_y,
             label_width_tenths_mm: Some(635),
             label_height_tenths_mm: Some(339),
+            cut: !options.no_cut,
+            cut_every: options.cut_every.unwrap_or(Options::default().cut_every),
+            compress: !options.no_compress,
             ..Options::default()
         },
     )?)
@@ -925,12 +1009,37 @@ fn transform_for_printer(
         }
         mono = raster::scale_to_width(&mono, head)?;
     }
-    let fit = match printer.alignment {
-        mb_printer_core::capabilities::Alignment::Left => Fit::Left,
-        mb_printer_core::capabilities::Alignment::Center => Fit::Center,
-        mb_printer_core::capabilities::Alignment::Right => Fit::Right,
+    let fit = match options.align.as_deref() {
+        Some("left") => Fit::Left,
+        Some("center") => Fit::Center,
+        Some("right") => Fit::Right,
+        Some(value) => return Err(format!("unknown alignment {value}").into()),
+        None => match printer.alignment {
+            mb_printer_core::capabilities::Alignment::Left => Fit::Left,
+            mb_printer_core::capabilities::Alignment::Center => Fit::Center,
+            mb_printer_core::capabilities::Alignment::Right => Fit::Right,
+        },
     };
-    Ok(mono.fit_head(head, fit)?)
+    let (offset_x, offset_y) = if printer.protocol == mb_printer_core::capabilities::Protocol::Tspl
+    {
+        (0, 0)
+    } else {
+        (i32::from(options.offset_x), i32::from(options.offset_y))
+    };
+    Ok(mono.place_on_head_byte_aligned(head, fit, offset_x, offset_y)?)
+}
+
+fn millimetres_to_tenths(
+    value: Option<f64>,
+    default: i16,
+) -> Result<i16, Box<dyn std::error::Error>> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    if !value.is_finite() {
+        return Err("millimetre protocol option must be finite".into());
+    }
+    Ok(i16::try_from((value * 10.0).round() as i64)?)
 }
 
 async fn execute_plan(
@@ -972,13 +1081,27 @@ async fn execute_plan(
         let mut target =
             TcpTransport::connect(address, options.payload_limit, Duration::from_secs(5))?;
         mb_printer_native::execute(plan, &mut target)?
-    } else if let Some(path) = uri
-        .strip_prefix("serial:")
-        .or_else(|| uri.strip_prefix("rfcomm:"))
-    {
+    } else if let Some(path) = uri.strip_prefix("serial:") {
         let mut target =
             SerialTransport::open(Path::new(path), options.baud, options.payload_limit)?;
         mb_printer_native::execute(plan, &mut target)?
+    } else if let Some(spec) = uri.strip_prefix("rfcomm:") {
+        #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+        {
+            let (address, channel) = parse_rfcomm(spec)?;
+            let mut target = mb_printer_native::transports::rfcomm::RfcommTransport::bind(
+                0,
+                address,
+                channel,
+                options.payload_limit,
+            )?;
+            mb_printer_native::execute(plan, &mut target)?
+        }
+        #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+        {
+            let _ = spec;
+            return Err("RFCOMM requires the bluetooth feature on Linux".into());
+        }
     } else if let Some(address) = uri.strip_prefix("ble:") {
         #[cfg(feature = "bluetooth")]
         {
@@ -1031,4 +1154,21 @@ async fn execute_plan(
         progress.bytes_written, progress.last_completed_action
     );
     Ok(())
+}
+
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+fn parse_rfcomm(spec: &str) -> Result<(&str, u8), Box<dyn std::error::Error>> {
+    let (address, channel) = spec.rsplit_once('@').map_or((spec, "1"), |parts| parts);
+    if address.is_empty()
+        || !address
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b':')
+    {
+        return Err("RFCOMM selector is rfcomm:MAC[@CHANNEL]".into());
+    }
+    let channel = channel.parse::<u8>()?;
+    if channel == 0 || channel > 30 {
+        return Err("RFCOMM channel must be 1..30".into());
+    }
+    Ok((address, channel))
 }

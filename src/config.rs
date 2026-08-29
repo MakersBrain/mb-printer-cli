@@ -26,7 +26,71 @@ pub struct Config {
     #[serde(default)]
     pub jobs_path: Option<PathBuf>,
     #[serde(default)]
-    pub printer_defaults: BTreeMap<String, serde_json::Value>,
+    pub printer_defaults: PrinterDefaults,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrinterDefaults {
+    pub model: Option<String>,
+    pub transport: Option<String>,
+    pub address: Option<String>,
+    pub device: Option<String>,
+    pub density: Option<u8>,
+    pub dpi: Option<u16>,
+    pub baud: Option<u32>,
+    pub payload_limit: Option<usize>,
+    pub feed: Option<u32>,
+    pub speed: Option<u8>,
+    pub offset_x: Option<f64>,
+    pub offset_y: Option<f64>,
+    pub align: Option<String>,
+    pub dither: Option<String>,
+    pub continuous: Option<bool>,
+    pub gap_mm: Option<f64>,
+    pub tspl_offset_mm: Option<f64>,
+    pub label: Option<String>,
+    pub media: Option<String>,
+    pub host: Option<String>,
+    pub font_fallback: Option<String>,
+    #[serde(default)]
+    pub data: BTreeMap<String, String>,
+}
+impl PrinterDefaults {
+    pub fn set_text(&mut self, key: &str, raw: &str) -> Result<(), serde_json::Error> {
+        let mut value = serde_json::to_value(&*self)?;
+        let parsed =
+            serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()));
+        if let Some(field) = key.strip_prefix("data.") {
+            value["data"]
+                .as_object_mut()
+                .expect("data serializes as an object")
+                .insert(field.to_owned(), parsed);
+        } else {
+            value
+                .as_object_mut()
+                .expect("defaults serialize as an object")
+                .insert(key.to_owned(), parsed);
+        }
+        *self = serde_json::from_value(value)?;
+        Ok(())
+    }
+    pub fn unset(&mut self, key: &str) -> Result<(), serde_json::Error> {
+        let mut value = serde_json::to_value(&*self)?;
+        if let Some(field) = key.strip_prefix("data.") {
+            value["data"]
+                .as_object_mut()
+                .expect("data serializes as an object")
+                .remove(field);
+        } else {
+            value
+                .as_object_mut()
+                .expect("defaults serialize as an object")
+                .remove(key);
+        }
+        *self = serde_json::from_value(value)?;
+        Ok(())
+    }
 }
 
 const fn default_port() -> u16 {
@@ -53,7 +117,7 @@ impl Default for Config {
             catalogue_path: None,
             connections_path: None,
             jobs_path: None,
-            printer_defaults: BTreeMap::new(),
+            printer_defaults: PrinterDefaults::default(),
         }
     }
 }
@@ -96,5 +160,17 @@ mod tests {
     #[test]
     fn rejects_unknown_config_fields() {
         assert!(serde_json::from_str::<Config>(r#"{"surprise":true}"#).is_err());
+    }
+    #[test]
+    fn printer_defaults_are_typed() {
+        assert!(
+            serde_json::from_str::<Config>(r#"{"printer_defaults":{"density":"hot"}}"#).is_err()
+        );
+        let config: Config = serde_json::from_str(
+            r#"{"printer_defaults":{"density":4,"continuous":true,"data":{"name":"Ada"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(config.printer_defaults.density, Some(4));
+        assert_eq!(config.printer_defaults.data["name"], "Ada");
     }
 }

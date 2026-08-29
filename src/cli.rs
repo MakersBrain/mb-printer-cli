@@ -160,6 +160,15 @@ pub struct RenderArgs {
     pub rows: u16,
     #[arg(long)]
     pub cut_marks: bool,
+    /// Preview scale while retaining the media-sized viewport.
+    #[arg(long, default_value_t = 1.0)]
+    pub zoom: f64,
+    /// Horizontal preview translation in millimetres.
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    pub offset_x_mm: f64,
+    /// Vertical preview translation in millimetres.
+    #[arg(long, default_value_t = 0.0, allow_hyphen_values = true)]
+    pub offset_y_mm: f64,
 }
 
 #[derive(Debug, Args)]
@@ -205,6 +214,36 @@ pub struct PrintOptions {
     pub payload_limit: usize,
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(1..=8))]
     pub density: u8,
+    /// Feed after each label, in dots.
+    #[arg(long)]
+    pub feed: Option<u8>,
+    /// Protocol print-speed setting.
+    #[arg(long)]
+    pub speed: Option<u8>,
+    /// Disable gap detection for continuous media.
+    #[arg(long)]
+    pub continuous: bool,
+    /// Override the model's head alignment.
+    #[arg(long, value_parser = ["left", "center", "right"])]
+    pub align: Option<String>,
+    /// Horizontal roller nudge across the head, in dots.
+    #[arg(long, default_value_t = 0)]
+    pub offset_x: u16,
+    /// Feed-direction nudge, in dots.
+    #[arg(long, default_value_t = 0)]
+    pub offset_y: u16,
+    /// TSPL gap between labels, in millimetres.
+    #[arg(long)]
+    pub gap_mm: Option<f64>,
+    /// TSPL OFFSET value, in millimetres.
+    #[arg(long, allow_hyphen_values = true)]
+    pub tspl_offset_mm: Option<f64>,
+    #[arg(long)]
+    pub no_cut: bool,
+    #[arg(long)]
+    pub cut_every: Option<u8>,
+    #[arg(long)]
+    pub no_compress: bool,
     #[arg(long, default_value_t = 115_200)]
     pub baud: u32,
     #[arg(long = "data", value_name = "KEY=VALUE")]

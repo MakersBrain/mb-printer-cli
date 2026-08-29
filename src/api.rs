@@ -557,6 +557,55 @@ async fn preview_document(
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum ExportFormat {
+    Png,
+    Pdf,
+}
+#[derive(Deserialize)]
+struct ExportQuery {
+    format: ExportFormat,
+}
+async fn export_document(
+    State(state): State<ApiState>,
+    Query(query): Query<ExportQuery>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    authorize(&state, &headers).await?;
+    if body.len() > state.config.max_document_bytes {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "document too large",
+        ));
+    }
+    let document = parse_document(&body)?;
+    let image = raster::render(&document, document.media.dpi).map_err(|_| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "document cannot be rasterized",
+        )
+    })?;
+    let (content_type, bytes) = match query.format {
+        ExportFormat::Png => (
+            "image/png",
+            raster::png(&image, document.media.dpi)
+                .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "PNG encoding failed"))?,
+        ),
+        ExportFormat::Pdf => (
+            "application/pdf",
+            mb_printer_core::export::pdf_physical(
+                &image,
+                document.media.width,
+                document.media.height,
+            )
+            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "PDF encoding failed"))?,
+        ),
+    };
+    Ok(([(http::header::CONTENT_TYPE, content_type)], bytes).into_response())
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JobRequest {
     document: serde_json::Value,
@@ -703,7 +752,8 @@ fn error_progress(error: &mb_printer_native::ExecuteError) -> Option<&mb_printer
         | mb_printer_native::ExecuteError::Response { progress, .. } => Some(progress),
         mb_printer_native::ExecuteError::AtomicTooLarge { .. }
         | mb_printer_native::ExecuteError::InvalidPlan { .. }
-        | mb_printer_native::ExecuteError::Replay(_) => None,
+        | mb_printer_native::ExecuteError::Replay(_)
+        | mb_printer_native::ExecuteError::ReplayStore(_) => None,
     }
 }
 fn execute_cancellable<T: mb_printer_native::Transport>(
@@ -1138,7 +1188,7 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/documents/validate", post(validate_document))
         .route("/v1/documents/preview", post(preview_document))
-        .route("/v1/documents/export", post(preview_document))
+        .route("/v1/documents/export", post(export_document))
         .route("/v1/jobs", post(submit_job))
         .route("/v1/jobs/{id}", get(get_job))
         .route("/v1/jobs/{id}/events", get(job_events))
@@ -1304,6 +1354,38 @@ mod tests {
         assert_eq!(
             app.clone().oneshot(authorized).await.unwrap().status(),
             StatusCode::OK
+        );
+        for (format, content_type, magic) in [
+            ("png", "image/png", b"\x89PNG".as_slice()),
+            ("pdf", "application/pdf", b"%PDF".as_slice()),
+        ] {
+            let export = Request::post(format!("/v1/documents/export?format={format}"))
+                .header("host", "localhost:9847")
+                .header("origin", "https://editor.example")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(include_str!(
+                    "../tests/fixtures/canonical-document.json"
+                )))
+                .unwrap();
+            let response = app.clone().oneshot(export).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[http::header::CONTENT_TYPE], content_type);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            assert!(bytes.starts_with(magic));
+        }
+        let missing_format = Request::post("/v1/documents/export")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(include_str!(
+                "../tests/fixtures/canonical-document.json"
+            )))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(missing_format).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
         );
         let request = Request::post("/v1/jobs")
             .header("host", "localhost:9847")

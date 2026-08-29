@@ -1,0 +1,10 @@
+{
+  "version": 4,
+  "name": "API export fixture",
+  "media": {"width": 10000, "height": 5000, "unit": "micrometre", "dpi": 203, "orientation": "portrait", "printableBounds": {"x": 0, "y": 0, "width": 10000, "height": 5000}, "shape": "rectangle", "continuous": false, "zones": []},
+  "coordinateSystem": {"unit": "micrometre", "origin": "top-left", "rounding": "half-away-from-zero"},
+  "elements": [{"type": "rectangle", "id": "box", "transform": {"x": 1000, "y": 1000, "width": 8000, "height": 3000}, "zOrder": 0, "strokeWidth": 125, "fill": false}],
+  "resources": [],
+  "fields": [],
+  "extensions": {"makersbrain:fixtureLicense": "AGPL-3.0-or-later"}
+}

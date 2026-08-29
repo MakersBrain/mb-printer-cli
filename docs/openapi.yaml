@@ -16,7 +16,23 @@ paths:
   /v1/jobs:
     post: {summary: Submit an editor or canonical v4 document, security: [{bearer: []}]}
   /v1/documents/export:
-    post: {summary: Export a canonical or editor v4 document as PNG, security: [{bearer: []}]}
+    post:
+      summary: Export a canonical or editor v4 document as PNG or exact-geometry PDF
+      security: [{bearer: []}]
+      parameters:
+        - {name: format, in: query, required: true, schema: {type: string, enum: [png, pdf]}}
+      requestBody:
+        required: true
+        content: {application/json: {schema: {type: object}}}
+      responses:
+        "200":
+          description: Encoded export
+          content:
+            image/png: {schema: {type: string, contentEncoding: binary}}
+            application/pdf: {schema: {type: string, contentEncoding: binary}}
+        "400": {description: Missing or unknown explicit format}
+        "401": {description: Invalid origin-bound bearer token}
+        "422": {description: Invalid or unrenderable document}
   /v1/laposte/extract:
     post: {summary: Reserved for SDK-normalized La Poste PDF extraction, security: [{bearer: []}]}
 components:

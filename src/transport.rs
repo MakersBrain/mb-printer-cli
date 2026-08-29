@@ -147,6 +147,14 @@ pub struct NativeDevice {
     pub transport: String,
     pub address: String,
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vendor_id: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub product_id: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub serial_number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ieee1284_device_id: Option<String>,
 }
 pub fn discover_native() -> io::Result<Vec<NativeDevice>> {
     #[allow(unused_mut)]
@@ -157,10 +165,29 @@ pub fn discover_native() -> io::Result<Vec<NativeDevice>> {
             transport: "serial".into(),
             address: p.port_name,
             name: None,
+            vendor_id: None,
+            product_id: None,
+            serial_number: None,
+            ieee1284_device_id: None,
         })
         .collect::<Vec<_>>();
     #[cfg(feature = "usb")]
     found.extend(usb::discover()?);
+    #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+    found.extend(
+        mb_printer_native::transports::rfcomm::discover_paired()
+            .map_err(io::Error::other)?
+            .into_iter()
+            .map(|device| NativeDevice {
+                transport: "rfcomm".into(),
+                address: device.address,
+                name: Some(device.name),
+                vendor_id: None,
+                product_id: None,
+                serial_number: None,
+                ieee1284_device_id: None,
+            }),
+    );
     Ok(found)
 }
 
@@ -192,6 +219,10 @@ pub mod bluetooth {
                     transport: "ble".into(),
                     address: peripheral.address().to_string(),
                     name: properties.and_then(|p| p.local_name),
+                    vendor_id: None,
+                    product_id: None,
+                    serial_number: None,
+                    ieee1284_device_id: None,
                 });
             }
             adapter.stop_scan().await.map_err(io::Error::other)?;
@@ -402,6 +433,21 @@ pub mod usb {
         let mut out = Vec::new();
         for device in devices.iter() {
             let descriptor = device.device_descriptor().map_err(io::Error::other)?;
+            let handle = device.open().ok();
+            let name = handle.as_ref().and_then(|handle| {
+                handle
+                    .read_product_string_ascii(&descriptor)
+                    .ok()
+                    .or_else(|| handle.read_manufacturer_string_ascii(&descriptor).ok())
+            });
+            let serial_number = handle
+                .as_ref()
+                .and_then(|handle| handle.read_serial_number_string_ascii(&descriptor).ok());
+            let ieee1284_device_id = handle.as_ref().and_then(|handle| {
+                read_ieee1284_device_id(&device, handle, Duration::from_millis(250))
+                    .ok()
+                    .flatten()
+            });
             out.push(NativeDevice {
                 transport: "usb".into(),
                 address: format!(
@@ -409,10 +455,80 @@ pub mod usb {
                     descriptor.vendor_id(),
                     descriptor.product_id()
                 ),
-                name: None,
+                name,
+                vendor_id: Some(descriptor.vendor_id()),
+                product_id: Some(descriptor.product_id()),
+                serial_number,
+                ieee1284_device_id,
             });
         }
         Ok(out)
+    }
+
+    fn read_ieee1284_device_id(
+        device: &rusb::Device<GlobalContext>,
+        handle: &DeviceHandle<GlobalContext>,
+        timeout: Duration,
+    ) -> io::Result<Option<String>> {
+        let config = device
+            .active_config_descriptor()
+            .map_err(io::Error::other)?;
+        let Some(interface) = config
+            .interfaces()
+            .flat_map(|interface| interface.descriptors())
+            .find(|descriptor| descriptor.class_code() == 7)
+            .map(|descriptor| descriptor.interface_number())
+        else {
+            return Ok(None);
+        };
+        let mut bytes = vec![0_u8; 2048];
+        let length = handle
+            .read_control(0xa1, 0, 0, u16::from(interface), &mut bytes, timeout)
+            .map_err(io::Error::other)?;
+        parse_ieee1284_device_id(&bytes[..length]).map(Some)
+    }
+
+    pub fn parse_ieee1284_device_id(bytes: &[u8]) -> io::Result<String> {
+        if bytes.len() < 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "short IEEE-1284 device ID",
+            ));
+        }
+        let declared = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]));
+        if declared < 2 || declared > bytes.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid IEEE-1284 device ID length",
+            ));
+        }
+        let value = std::str::from_utf8(&bytes[2..declared])
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+            .trim_matches(char::from(0))
+            .trim()
+            .to_owned();
+        if value.is_empty() || !value.contains(';') {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed IEEE-1284 device ID",
+            ));
+        }
+        Ok(value)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        #[test]
+        fn parses_bounded_ieee1284_identity() {
+            let payload = b"MFG:Brother;MDL:QL-1100;CMD:RASTER;";
+            let mut bytes = ((payload.len() + 2) as u16).to_be_bytes().to_vec();
+            bytes.extend_from_slice(payload);
+            assert_eq!(
+                super::parse_ieee1284_device_id(&bytes).unwrap(),
+                String::from_utf8(payload.to_vec()).unwrap()
+            );
+            assert!(super::parse_ieee1284_device_id(&[0, 40, b'M']).is_err());
+        }
     }
 }
 

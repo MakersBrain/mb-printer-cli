@@ -51,6 +51,102 @@ pub fn svg(image: &MonoRaster, dpi: u16) -> io::Result<Vec<u8>> {
     Ok(format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width_mm:.6}mm" height="{height_mm:.6}mm" viewBox="0 0 {} {}"><image width="{}" height="{}" href="data:image/png;base64,{}" image-rendering="pixelated"/></svg>"#, image.width, image.height, image.width, image.height, png).into_bytes())
 }
 
+/// Preserve a full-media source SVG as nested vector XML when it is safe and
+/// untransformed; otherwise use the deterministic portable raster fallback.
+pub fn svg_document(document: &Document, image: &MonoRaster, dpi: u16) -> io::Result<Vec<u8>> {
+    use base64::Engine as _;
+    let value = serde_json::to_value(document).map_err(io::Error::other)?;
+    let elements = value["elements"].as_array().unwrap_or(&Vec::new()).clone();
+    if elements.len() != 1 || elements[0]["type"] != "svg" {
+        return svg(image, dpi);
+    }
+    let element = &elements[0];
+    let transform = &element["transform"];
+    if transform["x"].as_i64() != Some(0)
+        || transform["y"].as_i64() != Some(0)
+        || transform["width"].as_i64() != Some(document.media.width)
+        || transform["height"].as_i64() != Some(document.media.height)
+    {
+        return svg(image, dpi);
+    }
+    let Some(resource_id) = element["resource"].as_str() else {
+        return svg(image, dpi);
+    };
+    let Some(resource) = value["resources"].as_array().and_then(|resources| {
+        resources
+            .iter()
+            .find(|resource| resource["id"] == resource_id)
+    }) else {
+        return svg(image, dpi);
+    };
+    if resource["mediaType"] != "image/svg+xml" {
+        return svg(image, dpi);
+    }
+    let Some(encoded) = resource["dataBase64"].as_str() else {
+        return svg(image, dpi);
+    };
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let source = String::from_utf8(bytes)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let lowered = source.to_ascii_lowercase();
+    if lowered.contains("<script")
+        || lowered.contains("onload=")
+        || lowered.contains("javascript:")
+        || lowered.contains("href=\"http")
+        || lowered.contains("href='http")
+    {
+        return svg(image, dpi);
+    }
+    let source = source
+        .trim_start()
+        .strip_prefix("<?xml")
+        .and_then(|tail| tail.split_once("?>").map(|(_, body)| body))
+        .unwrap_or(&source);
+    let width_mm = document.media.width as f64 / 1000.0;
+    let height_mm = document.media.height as f64 / 1000.0;
+    Ok(format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width_mm:.6}mm" height="{height_mm:.6}mm" viewBox="0 0 {} {}">{source}</svg>"#,
+        document.media.width, document.media.height
+    )
+    .into_bytes())
+}
+
+pub fn preview_transform(
+    image: &MonoRaster,
+    zoom: f64,
+    offset_x: f64,
+    offset_y: f64,
+) -> io::Result<MonoRaster> {
+    if !zoom.is_finite() || zoom <= 0.0 || !offset_x.is_finite() || !offset_y.is_finite() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "zoom must be positive and preview offsets finite",
+        ));
+    }
+    let mut pixels = vec![0; image.pixels.len()];
+    for y in 0..image.height {
+        for x in 0..image.width {
+            let source_x = (f64::from(x) - offset_x) / zoom;
+            let source_y = (f64::from(y) - offset_y) / zoom;
+            if source_x >= 0.0
+                && source_y >= 0.0
+                && source_x < f64::from(image.width)
+                && source_y < f64::from(image.height)
+            {
+                let source = source_y.floor() as u32 * image.width + source_x.floor() as u32;
+                pixels[(y * image.width + x) as usize] = image.pixels[source as usize];
+            }
+        }
+    }
+    Ok(MonoRaster {
+        width: image.width,
+        height: image.height,
+        pixels,
+    })
+}
+
 pub fn scale_to_width(image: &MonoRaster, width: u32) -> io::Result<MonoRaster> {
     if width == 0 || image.width == 0 || image.height == 0 {
         return Err(io::Error::new(
@@ -210,5 +306,23 @@ mod tests {
         assert_eq!(scale_to_width(&raster, 4).unwrap().height, 2);
         let pdf = sheet_pdf(&raster, 203, "a4", 5.0, 2.0, 2, 2, true).unwrap();
         assert!(String::from_utf8_lossy(&pdf).contains("/MediaBox [0 0 595.275591 841.889764]"));
+    }
+
+    #[test]
+    fn preview_transform_and_safe_vector_export_are_explicit() {
+        let raster = MonoRaster {
+            width: 3,
+            height: 2,
+            pixels: vec![1, 0, 0, 0, 1, 0],
+        };
+        assert_eq!(
+            preview_transform(&raster, 1.0, 1.0, 0.0).unwrap().pixels,
+            vec![0, 1, 0, 0, 0, 1]
+        );
+        assert!(preview_transform(&raster, 0.0, 0.0, 0.0).is_err());
+        let document = Document::from_json(r#"{"version":4,"name":"vector","media":{"width":10000,"height":5000,"unit":"micrometre","dpi":203,"orientation":"portrait","printableBounds":{"x":0,"y":0,"width":10000,"height":5000},"shape":"rectangle","continuous":false,"zones":[]},"coordinateSystem":{"unit":"micrometre","origin":"top-left","rounding":"half-away-from-zero"},"elements":[{"type":"svg","id":"art","transform":{"x":0,"y":0,"width":10000,"height":5000},"zOrder":0,"resource":"svg"}],"resources":[{"id":"svg","mediaType":"image/svg+xml","sha256":"0229f116e8648388eeb7cc0745f5dd4fd2c54392db57376ced9f3b05582153ce","dataBase64":"PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMCA1Ij48cGF0aCBkPSJNMCAwaDEwdjV6Ii8+PC9zdmc+"}]}"#).unwrap();
+        let exported = String::from_utf8(svg_document(&document, &raster, 203).unwrap()).unwrap();
+        assert!(exported.contains("<path d=\"M0 0h10v5z\""));
+        assert!(!exported.contains("data:image/png"));
     }
 }
