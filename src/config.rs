@@ -49,10 +49,6 @@ pub struct PrinterDefaults {
     pub continuous: Option<bool>,
     pub gap_mm: Option<f64>,
     pub tspl_offset_mm: Option<f64>,
-    pub label: Option<String>,
-    pub media: Option<String>,
-    pub host: Option<String>,
-    pub font_fallback: Option<String>,
     #[serde(default)]
     pub data: BTreeMap<String, String>,
 }

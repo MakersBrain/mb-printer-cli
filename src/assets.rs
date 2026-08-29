@@ -94,14 +94,8 @@ fn safe_kind(name: &str) -> Option<&'static str> {
     }
     if n.ends_with(".ttf") || n.ends_with(".otf") {
         Some("font")
-    } else if n.ends_with(".png")
-        || n.ends_with(".webp")
-        || n.ends_with(".jpg")
-        || n.ends_with(".svg")
-    {
+    } else if n.ends_with(".png") || n.ends_with(".webp") || n.ends_with(".jpg") {
         Some("image")
-    } else if n.ends_with(".json") || n.ends_with(".xml") {
-        Some("metadata")
     } else {
         None
     }
@@ -272,9 +266,48 @@ mod tests {
             "assets/paid/icon.png",
             "res/raw/token.json",
             "private/account.webp",
+            "assets/catalogue.json",
+            "res/values/public.xml",
+            "res/drawable/remote.svg",
         ] {
             assert_eq!(safe_kind(path), None, "{path}");
         }
+    }
+    #[test]
+    fn arbitrary_text_metadata_never_enters_private_bundle_bytes() {
+        use std::io::Write as _;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("adversarial.apk");
+        let file = File::create(&path).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        for (name, bytes) in [
+            (
+                "assets/innocent.json",
+                br#"{"apiToken":"secret"}"#.as_slice(),
+            ),
+            (
+                "res/values/strings.xml",
+                br#"<string name="password">secret</string>"#.as_slice(),
+            ),
+            (
+                "res/drawable/image.svg",
+                br#"<svg><image href="https://private.example/token"/></svg>"#.as_slice(),
+            ),
+        ] {
+            archive
+                .start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            archive.write_all(bytes).unwrap();
+        }
+        archive.finish().unwrap();
+        let bundle = scan_apks(&[path]).unwrap();
+        assert!(bundle.entries.is_empty());
+        assert!(!serde_json::to_string(&bundle).unwrap().contains("secret"));
+        assert!(
+            !serde_json::to_string(&bundle)
+                .unwrap()
+                .contains("private.example")
+        );
     }
     #[test]
     fn rejects_bundle_that_could_be_published() {

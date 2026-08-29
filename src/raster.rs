@@ -9,13 +9,33 @@ use mb_printer_core::{
 use std::{io, path::Path};
 
 pub fn render(document: &Document, dpi: u16) -> io::Result<MonoRaster> {
+    render_with_dither(document, dpi, None)
+}
+pub fn render_with_dither(
+    document: &Document,
+    dpi: u16,
+    dither: Option<&str>,
+) -> io::Result<MonoRaster> {
     let mut document = document.clone();
     document.media.dpi = dpi;
+    let dither = match dither.unwrap_or("threshold") {
+        "threshold" => mb_printer_core::raster::Dither::Threshold(128),
+        "floyd-steinberg" => mb_printer_core::raster::Dither::FloydSteinberg,
+        "atkinson" => mb_printer_core::raster::Dither::Atkinson,
+        "bayer2" => mb_printer_core::raster::Dither::Bayer2,
+        "bayer4" => mb_printer_core::raster::Dither::Bayer4,
+        value => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unknown dither {value}"),
+            ));
+        }
+    };
     render::render(
         &document,
         RenderOptions {
+            dither,
             max_pixels: 64 * 1024 * 1024,
-            ..RenderOptions::default()
         },
     )
     .map_err(io::Error::other)
@@ -54,63 +74,10 @@ pub fn svg(image: &MonoRaster, dpi: u16) -> io::Result<Vec<u8>> {
 /// Preserve a full-media source SVG as nested vector XML when it is safe and
 /// untransformed; otherwise use the deterministic portable raster fallback.
 pub fn svg_document(document: &Document, image: &MonoRaster, dpi: u16) -> io::Result<Vec<u8>> {
-    use base64::Engine as _;
-    let value = serde_json::to_value(document).map_err(io::Error::other)?;
-    let elements = value["elements"].as_array().unwrap_or(&Vec::new()).clone();
-    if elements.len() != 1 || elements[0]["type"] != "svg" {
-        return svg(image, dpi);
-    }
-    let element = &elements[0];
-    let transform = &element["transform"];
-    if transform["x"].as_i64() != Some(0)
-        || transform["y"].as_i64() != Some(0)
-        || transform["width"].as_i64() != Some(document.media.width)
-        || transform["height"].as_i64() != Some(document.media.height)
-    {
-        return svg(image, dpi);
-    }
-    let Some(resource_id) = element["resource"].as_str() else {
-        return svg(image, dpi);
-    };
-    let Some(resource) = value["resources"].as_array().and_then(|resources| {
-        resources
-            .iter()
-            .find(|resource| resource["id"] == resource_id)
-    }) else {
-        return svg(image, dpi);
-    };
-    if resource["mediaType"] != "image/svg+xml" {
-        return svg(image, dpi);
-    }
-    let Some(encoded) = resource["dataBase64"].as_str() else {
-        return svg(image, dpi);
-    };
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let source = String::from_utf8(bytes)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let lowered = source.to_ascii_lowercase();
-    if lowered.contains("<script")
-        || lowered.contains("onload=")
-        || lowered.contains("javascript:")
-        || lowered.contains("href=\"http")
-        || lowered.contains("href='http")
-    {
-        return svg(image, dpi);
-    }
-    let source = source
-        .trim_start()
-        .strip_prefix("<?xml")
-        .and_then(|tail| tail.split_once("?>").map(|(_, body)| body))
-        .unwrap_or(&source);
-    let width_mm = document.media.width as f64 / 1000.0;
-    let height_mm = document.media.height as f64 / 1000.0;
-    Ok(format!(
-        r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width_mm:.6}mm" height="{height_mm:.6}mm" viewBox="0 0 {} {}">{source}</svg>"#,
-        document.media.width, document.media.height
-    )
-    .into_bytes())
+    let _ = document;
+    // Embedded source markup is never copied into output: without a complete
+    // namespace-aware XML sanitizer, raster export is the only provably safe path.
+    svg(image, dpi)
 }
 
 pub fn preview_transform(
@@ -322,7 +289,7 @@ mod tests {
         assert!(preview_transform(&raster, 0.0, 0.0, 0.0).is_err());
         let document = Document::from_json(r#"{"version":4,"name":"vector","media":{"width":10000,"height":5000,"unit":"micrometre","dpi":203,"orientation":"portrait","printableBounds":{"x":0,"y":0,"width":10000,"height":5000},"shape":"rectangle","continuous":false,"zones":[]},"coordinateSystem":{"unit":"micrometre","origin":"top-left","rounding":"half-away-from-zero"},"elements":[{"type":"svg","id":"art","transform":{"x":0,"y":0,"width":10000,"height":5000},"zOrder":0,"resource":"svg"}],"resources":[{"id":"svg","mediaType":"image/svg+xml","sha256":"0229f116e8648388eeb7cc0745f5dd4fd2c54392db57376ced9f3b05582153ce","dataBase64":"PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMCA1Ij48cGF0aCBkPSJNMCAwaDEwdjV6Ii8+PC9zdmc+"}]}"#).unwrap();
         let exported = String::from_utf8(svg_document(&document, &raster, 203).unwrap()).unwrap();
-        assert!(exported.contains("<path d=\"M0 0h10v5z\""));
-        assert!(!exported.contains("data:image/png"));
+        assert!(!exported.contains("<path d=\"M0 0h10v5z\""));
+        assert!(exported.contains("data:image/png"));
     }
 }

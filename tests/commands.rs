@@ -325,3 +325,43 @@ fn mocked_brother_and_wifi_status_workflows_decode_without_hardware() {
     assert!(dry_status.status.success());
     assert!(String::from_utf8_lossy(&dry_status.stdout).contains("hardwareClaim"));
 }
+
+#[test]
+fn typed_nested_config_and_test_alias_are_exposed() {
+    let directory = tempfile::tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_mb-printer");
+    let config = directory.path().join("config.json");
+    for args in [
+        vec![
+            "--config",
+            config.to_str().unwrap(),
+            "config",
+            "set",
+            "printer_defaults.density",
+            "4",
+        ],
+        vec![
+            "--config",
+            config.to_str().unwrap(),
+            "config",
+            "get",
+            "printer_defaults.density",
+        ],
+    ] {
+        let output = Command::new(binary).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.stdout.is_empty() {
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "4");
+        }
+    }
+    let help = Command::new(binary)
+        .args(["test", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("density"));
+}

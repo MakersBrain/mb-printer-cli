@@ -366,6 +366,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         &json!({"target":target.printer,"connected":true,"status":"ipp-response","media":{"keyword":keyword,"sizeMm":keyword.and_then(mb_printer_cli::device::ipp_media_size)},"attributes":attributes})
                     )?
                 );
+            } else if let Some(path) = target
+                .printer
+                .as_deref()
+                .and_then(|value| value.strip_prefix("serial:"))
+            {
+                let mut transport = SerialTransport::open(Path::new(path), 115_200, 128)?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&query_brother_status(&mut transport)?)?
+                );
+            } else if let Some(spec) = target
+                .printer
+                .as_deref()
+                .and_then(|value| value.strip_prefix("rfcomm:"))
+            {
+                let _ = spec;
+                #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+                {
+                    let (address, channel) = parse_rfcomm(spec)?;
+                    let mut transport =
+                        mb_printer_native::transports::rfcomm::RfcommTransport::bind(
+                            0, address, channel, 128,
+                        )?;
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&query_brother_status(&mut transport)?)?
+                    );
+                }
+                #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+                return Err("RFCOMM requires the bluetooth feature on Linux".into());
             } else {
                 println!(
                     "{}",
@@ -461,7 +491,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ConfigCommand::Path => println!("{}", config_path.display()),
             ConfigCommand::Get { key } => {
                 let value = serde_json::to_value(&cfg)?;
-                println!("{}", value.get(&key).ok_or("unknown configuration key")?);
+                let nested = key
+                    .split('.')
+                    .try_fold(&value, |current, part| current.get(part));
+                println!("{}", nested.ok_or("unknown configuration key")?);
             }
             ConfigCommand::Set { key, value } => {
                 match key.as_str() {
@@ -538,10 +571,6 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "continuous",
                     "gap_mm",
                     "tspl_offset_mm",
-                    "label",
-                    "media",
-                    "host",
-                    "font_fallback",
                 ] {
                     if let Some(value) = legacy.get(key) {
                         migrated.insert(key.into(), value.clone());
@@ -846,6 +875,9 @@ fn apply_config_defaults(
     {
         options.density = value;
     }
+    if options.dither.is_none() {
+        options.dither = defaults.dither.clone();
+    }
     if options.dpi.is_none() {
         options.dpi = defaults.dpi;
     }
@@ -905,7 +937,11 @@ fn plan_document(
         .ok_or("--model is required for planning and printing")?;
     let printer =
         capabilities::by_id(model).ok_or_else(|| format!("unknown printer model {model}"))?;
-    let mut mono = raster::render(document, options.dpi.unwrap_or(printer.dpi))?;
+    let mut mono = raster::render_with_dither(
+        document,
+        options.dpi.unwrap_or(printer.dpi),
+        options.dither.as_deref(),
+    )?;
     mono = transform_for_printer(mono, &printer, options)?;
     let head = printer
         .width_px()
@@ -1171,4 +1207,19 @@ fn parse_rfcomm(spec: &str) -> Result<(&str, u8), Box<dyn std::error::Error>> {
         return Err("RFCOMM channel must be 1..30".into());
     }
     Ok((address, channel))
+}
+
+fn query_brother_status<T: mb_printer_native::Transport>(
+    transport: &mut T,
+) -> Result<mb_printer_cli::device::BrotherStatus, Box<dyn std::error::Error>> {
+    transport.write(b"\x1biS")?;
+    match transport.wait_response(3_000)? {
+        mb_printer_native::WaitOutcome::Response(bytes) => {
+            Ok(mb_printer_cli::device::brother_status(&bytes)?)
+        }
+        mb_printer_native::WaitOutcome::Timeout => Err("Brother status timed out".into()),
+        mb_printer_native::WaitOutcome::Unavailable => {
+            Err("transport cannot read Brother status".into())
+        }
+    }
 }

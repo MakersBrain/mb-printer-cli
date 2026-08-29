@@ -39,7 +39,7 @@ pub enum Command {
     },
     Status(PrinterTarget),
     Print(PrintArgs),
-    #[command(name = "density-test")]
+    #[command(name = "density-test", alias = "test")]
     DensityTest {
         #[command(flatten)]
         options: PrintOptions,
@@ -214,6 +214,9 @@ pub struct PrintOptions {
     pub payload_limit: usize,
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u8).range(1..=8))]
     pub density: u8,
+    /// Raster dithering: threshold, floyd-steinberg, atkinson, bayer2, or bayer4.
+    #[arg(long)]
+    pub dither: Option<String>,
     /// Feed after each label, in dots.
     #[arg(long)]
     pub feed: Option<u8>,

@@ -341,8 +341,36 @@ async fn printers(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers).await?;
+    let mut devices = state.injected_devices.read().await.clone();
+    devices.extend(crate::transport::discover_native().unwrap_or_default());
+    let discovered = devices
+        .into_iter()
+        .map(|device| {
+            let haystack = format!(
+                "{} {}",
+                device.name.as_deref().unwrap_or(""),
+                device.address
+            )
+            .to_ascii_lowercase();
+            let model = capabilities::bundled()
+                .into_iter()
+                .find(|definition| {
+                    haystack.contains(&definition.id.to_ascii_lowercase())
+                        || haystack.contains(&definition.name.to_ascii_lowercase())
+                })
+                .map(|definition| definition.id);
+            serde_json::json!({"source":"discovery","device":device,"matchedModel":model})
+        })
+        .collect::<Vec<_>>();
+    let configured = state
+        .connections
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
     Ok(Json(
-        serde_json::json!({"printers":[],"definitions":capabilities::bundled()}),
+        serde_json::json!({"printers":{"discovered":discovered,"configured":configured},"definitions":capabilities::bundled()}),
     ))
 }
 async fn discovery(
@@ -431,7 +459,7 @@ fn probe_transport(transport: &serde_json::Value) -> Result<ProbeResult, ApiErro
                     .map(|_| ())
                     .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "TCP probe failed"))
             }),
-        "serial" | "rfcomm" => {
+        "serial" => {
             let path = transport["path"].as_str().ok_or(ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "serial path required",
@@ -440,6 +468,24 @@ fn probe_transport(transport: &serde_json::Value) -> Result<ProbeResult, ApiErro
             SerialTransport::open(std::path::Path::new(path), baud, 128)
                 .map(|_| ())
                 .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "serial probe failed"))
+        }
+        #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+        "rfcomm" => {
+            let address = transport["address"].as_str().ok_or(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "RFCOMM address required",
+            ))?;
+            let channel = transport["channel"].as_u64().unwrap_or(1) as u8;
+            mb_printer_native::transports::rfcomm::RfcommTransport::bind(0, address, channel, 128)
+                .map(|_| ())
+                .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "RFCOMM probe failed"))
+        }
+        #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+        "rfcomm" => {
+            return Err(ApiError(
+                StatusCode::BAD_GATEWAY,
+                "RFCOMM unavailable in this build",
+            ));
         }
         "file" => {
             let path = transport["path"].as_str().ok_or(ApiError(
@@ -453,10 +499,28 @@ fn probe_transport(transport: &serde_json::Value) -> Result<ProbeResult, ApiErro
                 .map(|_| ())
                 .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "file probe failed"))
         }
-        "usb" | "ble" => {
+        #[cfg(feature = "usb")]
+        "usb" => crate::transport::usb::UsbTransport::open(
+            transport["vid"].as_u64().unwrap_or(0) as u16,
+            transport["pid"].as_u64().unwrap_or(0) as u16,
+            transport["interface"].as_u64().unwrap_or(0) as u8,
+            transport["out"].as_u64().unwrap_or(0) as u8,
+            transport["input"].as_u64().map(|value| value as u8),
+            128,
+        )
+        .map(|_| ())
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "USB probe failed")),
+        #[cfg(not(feature = "usb"))]
+        "usb" => {
             return Err(ApiError(
                 StatusCode::BAD_GATEWAY,
-                "feature-gated transport requires injected platform probe",
+                "USB unavailable in this build",
+            ));
+        }
+        "ble" => {
+            return Err(ApiError(
+                StatusCode::BAD_GATEWAY,
+                "BLE probe requires asynchronous discovery/connection",
             ));
         }
         _ => {
@@ -483,13 +547,29 @@ async fn status(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers).await?;
     let connections = state.connections.read().await;
-    let selected = query.connection.as_ref().and_then(|id| connections.get(id));
+    let selected = query
+        .connection
+        .as_ref()
+        .and_then(|id| connections.get(id))
+        .cloned();
+    let configured = connections.values().cloned().collect::<Vec<_>>();
+    drop(connections);
     Ok(Json(match selected {
         Some(value) => {
-            serde_json::json!({"connection":value,"connected":value.status=="ready","status":value.status,"media":value.media})
+            let live =
+                if let Some(probe) = state.injected_probes.read().await.get(&value.id).cloned() {
+                    Ok(probe)
+                } else {
+                    probe_transport(&value.transport)
+                };
+            let (connected, status, media) = match live {
+                Ok(probe) => (true, probe.status, probe.media.or(value.media.clone())),
+                Err(_) => (false, "unavailable".into(), value.media.clone()),
+            };
+            serde_json::json!({"connection":value,"connected":connected,"status":status,"media":media})
         }
         None => {
-            serde_json::json!({"connections":connections.values().collect::<Vec<_>>(),"connected":false,"status":"not-connected","media":null})
+            serde_json::json!({"connections":configured,"connected":false,"status":"not-connected","media":null})
         }
     }))
 }
@@ -1331,6 +1411,17 @@ mod tests {
                 },
             )
             .await;
+        state
+            .inject_devices(vec![crate::transport::NativeDevice {
+                transport: "serial".into(),
+                address: "/dev/mock-m110".into(),
+                name: Some("Brother m110 fixture".into()),
+                vendor_id: None,
+                product_id: None,
+                serial_number: None,
+                ieee1284_device_id: None,
+            }])
+            .await;
         let app = router(state.clone());
         let request = Request::post("/v1/pair")
             .header("host", "localhost:9847")
@@ -1355,6 +1446,16 @@ mod tests {
             app.clone().oneshot(authorized).await.unwrap().status(),
             StatusCode::OK
         );
+        let request = Request::get("/v1/printers")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(listing["printers"]["discovered"][0]["matchedModel"], "m110");
         for (format, content_type, magic) in [
             ("png", "image/png", b"\x89PNG".as_slice()),
             ("pdf", "application/pdf", b"%PDF".as_slice()),
@@ -1478,7 +1579,7 @@ mod tests {
         }
     }
     #[test]
-    fn cooperative_cancel_before_first_write_is_unambiguous() {
+    fn cancellation_at_first_write_uses_conservative_ambiguous_outcome() {
         use mb_printer_core::protocol::{Action, Boundary, Plan};
         let cancel = Arc::new(AtomicBool::new(true));
         let mut target = Cancellable {
@@ -1501,7 +1602,41 @@ mod tests {
         };
         let error = mb_printer_native::execute(&plan, &mut target).unwrap_err();
         let progress = error_progress(&error).unwrap();
-        assert!(!progress.potentially_accepted_write);
+        assert!(progress.potentially_accepted_write);
+        assert_eq!(progress.bytes_written, 0);
+    }
+    #[test]
+    fn first_write_error_is_reported_as_potentially_accepted() {
+        struct FailFirstWrite;
+        impl mb_printer_native::Transport for FailFirstWrite {
+            fn payload_limit(&self) -> usize {
+                128
+            }
+            fn subscribe_notifications(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn write(&mut self, _: &[u8]) -> Result<(), String> {
+                Err("disconnect".into())
+            }
+            fn delay_monotonic(&mut self, _: u64) {}
+            fn wait_response(&mut self, _: u64) -> Result<mb_printer_native::WaitOutcome, String> {
+                Ok(mb_printer_native::WaitOutcome::Unavailable)
+            }
+        }
+        use mb_printer_core::protocol::{Action, Plan};
+        let plan = Plan {
+            protocol: mb_printer_core::capabilities::Protocol::MSeries,
+            source_commit: "test".into(),
+            actions: vec![Action::CommandWrite {
+                name: "first".into(),
+                bytes: vec![1],
+                atomic: true,
+            }],
+        };
+        let error = execute_cancellable(&plan, FailFirstWrite, Arc::new(AtomicBool::new(false)))
+            .unwrap_err();
+        let progress = error.1.unwrap();
+        assert!(progress.potentially_accepted_write);
         assert_eq!(progress.bytes_written, 0);
     }
     #[test]
