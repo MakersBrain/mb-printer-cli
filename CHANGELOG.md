@@ -15,6 +15,8 @@
   dual-stack loopback serving, self-service browser grants, preview viewport
   controls and per-slot La Poste selection.
 - Completed and test-validated the OpenAPI 3.1 route and payload contract.
+- Aligned the CLI minimum Rust toolchain and lockfile with the SDK's Rust 1.92
+  deterministic PDF-rendering dependency graph.
 
 This project follows Semantic Versioning. The loopback API is independently
 versioned by its `/v1` path; breaking API or document changes require a new

@@ -25,9 +25,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - shell: bash
         run: |
-          rustup toolchain install 1.88.0 --profile minimal
-          rustup default 1.88.0
-          test "$(rustc --version | cut -d' ' -f2)" = 1.88.0
+          rustup toolchain install 1.92.0 --profile minimal
+          rustup default 1.92.0
+          test "$(rustc --version | cut -d' ' -f2)" = 1.92.0
       - shell: bash
         run: cargo test --locked --all-targets --features "${{ matrix.features }}"
       - shell: bash

@@ -15,8 +15,8 @@ jobs:
           repository: makersbrain/mb-printer-sdk
           path: _sdk
       - run: ln -s "$GITHUB_WORKSPACE/_sdk" "$GITHUB_WORKSPACE/../mb-printer-sdk"
-      - run: rustup toolchain install 1.88.0 --profile minimal --component rustfmt --component clippy && rustup default 1.88.0
-      - run: test "$(rustc --version | cut -d' ' -f2)" = 1.88.0
+      - run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy && rustup default 1.92.0
+      - run: test "$(rustc --version | cut -d' ' -f2)" = 1.92.0
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --all-targets -- -D warnings
