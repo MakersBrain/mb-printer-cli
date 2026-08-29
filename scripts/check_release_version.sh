@@ -8,6 +8,9 @@ changelog=$release_root/CHANGELOG.md
 lockfile=$release_root/Cargo.lock
 version=$(sed -n '0,/^version = "/s/^version = "\([^"]*\)"/\1/p' "$manifest")
 tag=${1:-${GITHUB_REF_NAME:-}}
+if [ "$tag" = "--manifest-only" ]; then
+  tag=
+fi
 
 case "$version" in
   ''|*[!0-9.]*|.*|*.|*..*) echo "invalid package version: $version" >&2; exit 1 ;;

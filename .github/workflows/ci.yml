@@ -19,7 +19,7 @@ jobs:
       - run: test "$(rustc --version | cut -d' ' -f2)" = 1.92.0
       - run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - run: cargo fmt --all --check
-      - run: sh scripts/check_release_version.sh
+      - run: sh scripts/check_release_version.sh --manifest-only
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
       - run: cargo check --locked --all-targets --all-features
