@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+openapi: 3.1.0
+info: {title: mb-printer loopback API, version: 1.0.0}
+servers: [{url: "http://127.0.0.1:9847"}]
+paths:
+  /v1/pair:
+    post: {summary: Exchange a one-time secret for an origin-bound token}
+  /v1/capabilities:
+    get: {summary: SDK and service capabilities, security: [{bearer: []}]}
+  /v1/discovery:
+    post: {summary: Discover native printer transports, security: [{bearer: []}]}
+  /v1/connection:
+    post: {summary: Persist a bounded connection definition, security: [{bearer: []}]}
+  /v1/status:
+    get: {summary: Read configured connection status and media, security: [{bearer: []}]}
+  /v1/jobs:
+    post: {summary: Submit an editor or canonical v4 document, security: [{bearer: []}]}
+  /v1/documents/export:
+    post: {summary: Export a canonical or editor v4 document as PNG, security: [{bearer: []}]}
+  /v1/laposte/extract:
+    post: {summary: Reserved for SDK-normalized La Poste PDF extraction, security: [{bearer: []}]}
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer}
+  schemas:
+    PairResponse:
+      type: object
+      required: [grantId, token, expiresAt]
+      properties: {grantId: {type: string, format: uuid}, token: {type: string}, expiresAt: {type: string, format: date-time}}
+    Job:
+      type: object
+      required: [id, state, terminal, lastCompletedAction, bytesSent, action, actions, totalBytes, phase]
+      properties: {id: {type: string, format: uuid}, state: {type: string}, terminal: {type: boolean}, outcome: {type: [string, "null"]}, lastCompletedAction: {type: integer}, bytesSent: {type: integer}, action: {type: integer}, actions: {type: integer}, totalBytes: {type: integer}, phase: {type: string}}

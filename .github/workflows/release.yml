@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+name: Release
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: ubuntu-latest, artifact: mb-printer-linux-x86_64-full, binary: mb-printer, features: "usb,bluetooth"}
+          - {os: macos-latest, artifact: mb-printer-macos-aarch64-full, binary: mb-printer, features: "usb,bluetooth"}
+          - {os: windows-latest, artifact: mb-printer-windows-x86_64-full.exe, binary: mb-printer.exe, features: "usb,bluetooth"}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with: {repository: makersbrain/mb-printer-sdk, path: _sdk}
+      - shell: bash
+        run: cp -R _sdk ../mb-printer-sdk
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
+      - shell: bash
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          rustup default 1.88.0
+          test "$(rustc --version | cut -d' ' -f2)" = 1.88.0
+      - shell: bash
+        run: cargo test --locked --all-targets --features "${{ matrix.features }}"
+      - shell: bash
+        run: cargo build --locked --release --features "${{ matrix.features }}"
+      - shell: bash
+        run: |
+          cp "target/release/${{ matrix.binary }}" "${{ matrix.artifact }}"
+          shasum -a 256 "${{ matrix.artifact }}" > "${{ matrix.artifact }}.sha256"
+          cargo metadata --locked --format-version 1 > "${{ matrix.artifact }}.sbom.json"
+      - uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            ${{ matrix.artifact }}
+            ${{ matrix.artifact }}.sha256
+            ${{ matrix.artifact }}.sbom.json
+            LICENSE
+            NOTICE.md
+            THIRD_PARTY_LICENSES.md
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16
+        with: {path: dist, merge-multiple: true}
+      - env: {GH_TOKEN: "${{ github.token }}"}
+        run: gh release create "${{ github.ref_name }}" dist/* --generate-notes --verify-tag
