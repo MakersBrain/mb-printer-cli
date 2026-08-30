@@ -28,7 +28,8 @@ capture-only pilot.
 
 ## Verification performed
 
-- `mb-print-cloud`: 5 unit/integration tests and strict all-target Clippy pass.
+- `mb-print-cloud`: 8 unit/integration tests and strict all-target Clippy pass,
+  including generated OpenAPI, exact-origin CORS, and agent progress fields.
 - `mb-printer-cli`: 52 library tests, 11 process/contract/release tests, doc
   tests, and strict all-target Clippy pass.
 - A real process-level capture exercised config initialization, enrollment,
@@ -37,6 +38,10 @@ capture-only pilot.
 - The capture contained 1,947 bytes. Reconnect and revocation did not change
   its size or modification time, providing evidence that the terminal job was
   not physically replayed.
+- The label-editor cloud route was qualified through the same real broker and
+  agent path. The completed response preserved all 13 actions
+  (`lastCompletedAction` 12), and an idempotent replay returned the same job
+  without changing the 1,947-byte capture.
 - After cloud restart, the terminal job remained readable and its printer was
   offline until the agent reconnected. Revocation closed authentication and
   left the printer disabled/offline.
@@ -45,6 +50,5 @@ capture-only pilot.
 
 No physical printer family is enabled by this work. Physical disconnect and
 cancellation evidence must be collected per printer family before a production
-pilot. Editor/Odoo cloud-route UI work remains optional until a pilot selects
-those clients; both can already call the standalone JSON API without receiving
-agent credentials.
+pilot. Odoo cloud-route UI work remains optional; the label editor now uses the
+standalone JSON API without receiving agent credentials.

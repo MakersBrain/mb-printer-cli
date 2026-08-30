@@ -54,6 +54,7 @@ fn status(job: &Job) -> wire::JobStatus {
             .as_deref()
             .map(safe_error_code)
             .unwrap_or_default(),
+        action_count: job.action_count as u64,
     }
 }
 

@@ -89,4 +89,5 @@ message JobStatus {
   uint64 total_bytes = 6;
   bool potentially_accepted_write = 7;
   string error_code = 8;
+  uint64 action_count = 9;
 }
