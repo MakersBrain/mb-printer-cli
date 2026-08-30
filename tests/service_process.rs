@@ -114,19 +114,104 @@ fn pairing(binary: &str, config: &Path) -> String {
         .unwrap()
         .to_owned()
 }
-fn exchange(port: u16, secret: &str) -> serde_json::Value {
+fn exchange_at_origin(port: u16, secret: &str, origin: &str) -> serde_json::Value {
     let (status, _, body) = request(
         port,
         "POST",
         "/v1/pair",
-        &[
-            ("Origin", "https://editor.example"),
-            ("Content-Type", "application/json"),
-        ],
+        &[("Origin", origin), ("Content-Type", "application/json")],
         &serde_json::json!({"secret":secret}).to_string(),
     );
     assert_eq!(status, 200, "{body}");
     serde_json::from_str(&body).unwrap()
+}
+
+fn exchange(port: u16, secret: &str) -> serde_json::Value {
+    exchange_at_origin(port, secret, "https://editor.example")
+}
+
+#[test]
+fn hosted_editor_preflight_and_grant_are_exact_in_real_service() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    let origin = "https://labels.dev1.makersbrain.net";
+    fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({"allowed_origins":[origin]})).unwrap(),
+    )
+    .unwrap();
+    let port = TcpListener::bind(("127.0.0.1", 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let binary = env!("CARGO_BIN_EXE_mb-printer");
+    let secret = pairing(binary, &config);
+    let mut server = start(binary, &config, port);
+
+    let (status, headers, _) = request(
+        port,
+        "OPTIONS",
+        "/v1/status",
+        &[
+            ("Origin", origin),
+            ("Access-Control-Request-Method", "GET"),
+            ("Access-Control-Request-Private-Network", "true"),
+        ],
+        "",
+    );
+    assert_eq!(status, 200);
+    let headers = headers.to_ascii_lowercase();
+    assert!(headers.contains("access-control-allow-origin: https://labels.dev1.makersbrain.net"));
+    assert!(headers.contains("access-control-allow-private-network: true"));
+
+    let pair = exchange_at_origin(port, &secret, origin);
+    let auth = format!("Bearer {}", pair["token"].as_str().unwrap());
+    assert_eq!(
+        request(
+            port,
+            "GET",
+            "/v1/capabilities",
+            &[("Origin", origin), ("Authorization", &auth)],
+            ""
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        request(
+            port,
+            "GET",
+            "/v1/capabilities",
+            &[
+                ("Origin", "https://editor.example"),
+                ("Authorization", &auth)
+            ],
+            ""
+        )
+        .0,
+        401
+    );
+    let (status, headers, _) = request(
+        port,
+        "OPTIONS",
+        "/v1/status",
+        &[
+            ("Origin", "https://labels.dev1.makersbrain.net.evil.example"),
+            ("Access-Control-Request-Method", "GET"),
+            ("Access-Control-Request-Private-Network", "true"),
+        ],
+        "",
+    );
+    assert_eq!(status, 403);
+    assert!(
+        !headers
+            .to_ascii_lowercase()
+            .contains("access-control-allow-private-network")
+    );
+
+    server.kill().unwrap();
+    server.wait().unwrap();
 }
 
 #[test]

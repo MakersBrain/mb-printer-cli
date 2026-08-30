@@ -18,14 +18,30 @@ use mb_printer_core::{
     protocol::{self, Options, Plan},
 };
 use serde_json::json;
-use std::{fs, path::Path, time::Duration};
+use std::{
+    fs,
+    path::Path,
+    time::{Duration, Instant},
+};
+use tracing::Instrument as _;
 
 #[tokio::main]
 async fn main() {
+    init_tracing();
     if let Err(error) = run().await {
         eprintln!("mb-printer: {error}");
         std::process::exit(2);
     }
+}
+
+fn init_tracing() {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new("mb_printer=info,mb_printer_cli=info")
+    });
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .try_init();
 }
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -1269,6 +1285,52 @@ async fn execute_plan(
     plan: &Plan,
     options: &mb_printer_cli::cli::PrintOptions,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let total_bytes = plan
+        .actions
+        .iter()
+        .map(|action| match action {
+            mb_printer_core::protocol::Action::CommandWrite { bytes, .. }
+            | mb_printer_core::protocol::Action::RasterWrite { bytes, .. } => bytes.len() as u64,
+            _ => 0,
+        })
+        .sum::<u64>();
+    let span = tracing::info_span!(
+        "cli.print.execute",
+        protocol = ?plan.protocol,
+        copies = options.copies,
+        action_count = plan.actions.len(),
+        total_bytes,
+        outcome = tracing::field::Empty,
+        duration_ms = tracing::field::Empty,
+    );
+    let started = Instant::now();
+    let result = execute_plan_inner(plan, options)
+        .instrument(span.clone())
+        .await;
+    span.record(
+        "outcome",
+        if result.is_ok() {
+            "completed"
+        } else {
+            "failed"
+        },
+    );
+    span.record(
+        "duration_ms",
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    if result.is_ok() {
+        tracing::info!(parent: &span, "CLI print execution completed");
+    } else {
+        tracing::warn!(parent: &span, "CLI print execution failed");
+    }
+    result
+}
+
+async fn execute_plan_inner(
+    plan: &Plan,
+    options: &mb_printer_cli::cli::PrintOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
     if options.dry_run {
         let mut target = CaptureTransport::new(options.payload_limit);
         if matches!(
@@ -1480,5 +1542,14 @@ fn query_brother_status<T: mb_printer_native::Transport>(
         mb_printer_native::WaitOutcome::Unavailable => {
             Err("transport cannot read Brother status".into())
         }
+    }
+}
+
+#[cfg(test)]
+mod observability_tests {
+    #[test]
+    fn tracing_initialization_is_idempotent() {
+        super::init_tracing();
+        super::init_tracing();
     }
 }

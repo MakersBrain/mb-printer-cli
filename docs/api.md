@@ -52,6 +52,18 @@ allowed; bearer tokens are used instead of ambient credentials.
 allowlisted PNA preflight. Loopback Host and origin checks remain independent
 of CORS response headers.
 
+For the dev1 hosted editor, configure the exact origin rather than a wildcard:
+
+```sh
+mb-printer config set allowed_origins \
+  'http://127.0.0.1:4173,http://localhost:4173,https://labels.dev1.makersbrain.net'
+```
+
+Open the HTTPS editor and create a fresh pairing secret. Grants are bound to
+the origin that exchanges the secret, so a token paired from the loopback
+editor cannot be reused by `https://labels.dev1.makersbrain.net` or another
+workspace. Keep the API on loopback; never add port 9847 to Cloudflare Tunnel.
+
 `POST /v1/connection` persists a bounded connection definition. Discovery and
 `GET /v1/status?connection=ID` expose live backend-reported transport, status
 and media data. A persisted `kind: "ipp"` connection uses the same endpoint for
