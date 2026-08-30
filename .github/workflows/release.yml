@@ -17,10 +17,17 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - id: sdk
+        shell: bash
+        run: echo "ref=$(tr -d '[:space:]' < .github/sdk-ref)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
-        with: {repository: makersbrain/mb-printer-sdk, path: _sdk}
+        with:
+          repository: makersbrain/mb-printer-sdk
+          path: _sdk
+          ref: '${{ steps.sdk.outputs.ref }}'
+          fetch-depth: 0
       - shell: bash
-        run: cp -R _sdk ../mb-printer-sdk
+        run: test "$(git -C _sdk rev-parse HEAD)" = "${{ steps.sdk.outputs.ref }}" && scripts/check_sdk_pin.sh _sdk && cp -R _sdk ../mb-printer-sdk
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - shell: bash

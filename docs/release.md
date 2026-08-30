@@ -10,6 +10,8 @@ entries under `Unreleased`, or mismatched SDK dependency requirements.
 Before creating a tag, finalize the changelog and run:
 
 ```sh
+scripts/pin_sdk.sh <merged-sdk-commit>
+scripts/check_sdk_pin.sh ../mb-printer-sdk
 scripts/check_release_version.sh v0.1.0
 cargo test --locked
 cargo clippy --locked --all-targets -- -D warnings
@@ -26,6 +28,13 @@ Linux feature-complete candidates require `pkg-config` and D-Bus development
 headers. The same platform prerequisites documented for Bluetooth installation
 must be available before running the script.
 
+The committed `.github/sdk-ref` is the single SDK source revision used by CI,
+tagged releases, and local release candidates. The pin must be a full commit on
+`mb-printer-sdk`'s `origin/main`; update it only after the required SDK change is
+merged. The sheet-export migration must not land until this pin is advanced to the
+merged SDK commit that provides `mb_printer_core::sheet`; a local uncommitted SDK
+worktree is never a valid substitute for that pin.
+
 The candidate script uses locked dependencies and the feature-complete local
 profile (`usb,bluetooth` by default), installs pinned `cargo-cyclonedx` 0.5.7
 in an isolated temporary tool root when needed, and emits:
@@ -36,10 +45,11 @@ in an isolated temporary tool root when needed, and emits:
 - `LICENSE`, `NOTICE.md`, `THIRD_PARTY_LICENSES.md`, and aggregate
   `SHA256SUMS`.
 
-It reconstructs clean CLI and SDK source trees from each repository's `HEAD`,
-installs the CLI into a new temporary Cargo root, and executes the installed
-binary's `--version`. Any dirty worktree, build, checksum, SBOM, archive,
-installation, or version failure stops the candidate build. Set
+It reconstructs the CLI from its committed `HEAD` and the SDK from the pinned
+commit, installs the CLI into a new temporary Cargo root, and executes the
+installed binary's `--version`. Any dirty CLI worktree, invalid SDK pin, build,
+checksum, SBOM, archive, installation, or version failure stops the candidate
+build. Set
 `MB_PRINTER_RELEASE_FEATURES` only when deliberately producing a documented
 platform-specific feature variant.
 

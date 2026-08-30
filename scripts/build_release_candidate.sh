@@ -15,13 +15,19 @@ if git -C "$release_root" status --porcelain | grep -q .; then
   exit 1
 fi
 "$release_root/scripts/check_release_version.sh" "v$version"
+sdk_root=$release_root/../mb-printer-sdk
+sdk_ref=$($release_root/scripts/check_sdk_pin.sh "$sdk_root")
 mkdir -p "$output"
 output=$(CDPATH= cd -- "$output" && pwd)
 work=$(mktemp -d "${TMPDIR:-/tmp}/mb-printer-release.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 
-cargo build --manifest-path "$release_root/Cargo.toml" --release --locked --features "$features"
-cp "$release_root/target/release/mb-printer" "$output/$artifact"
+mkdir -p "$work/mb-printer-cli" "$work/mb-printer-sdk" "$work/install"
+git -C "$release_root" archive HEAD | tar -xf - -C "$work/mb-printer-cli"
+git -C "$sdk_root" archive "$sdk_ref" | tar -xf - -C "$work/mb-printer-sdk"
+
+cargo build --manifest-path "$work/mb-printer-cli/Cargo.toml" --release --locked --features "$features"
+cp "$work/mb-printer-cli/target/release/mb-printer" "$output/$artifact"
 (cd "$output" && sha256sum "$artifact" >"$artifact.sha256")
 
 if ! command -v cargo-cyclonedx >/dev/null 2>&1 ||
@@ -31,8 +37,8 @@ if ! command -v cargo-cyclonedx >/dev/null 2>&1 ||
 else
   cyclonedx=$(command -v cargo-cyclonedx)
 fi
-(cd "$release_root" && "$cyclonedx" cyclonedx --format json --spec-version 1.5 --override-filename "$artifact.sbom")
-mv "$release_root/$artifact.sbom.json" "$output/$artifact.sbom.json"
+(cd "$work/mb-printer-cli" && "$cyclonedx" cyclonedx --format json --spec-version 1.5 --override-filename "$artifact.sbom")
+mv "$work/mb-printer-cli/$artifact.sbom.json" "$output/$artifact.sbom.json"
 
 git -C "$release_root" archive --format=tar --prefix="mb-printer-cli-$version/" HEAD |
   gzip -n >"$output/mb-printer-cli-$version-source.tar.gz"
@@ -40,9 +46,6 @@ for notice in LICENSE NOTICE.md THIRD_PARTY_LICENSES.md; do
   cp "$release_root/$notice" "$output/$notice"
 done
 
-mkdir -p "$work/mb-printer-cli" "$work/mb-printer-sdk" "$work/install"
-git -C "$release_root" archive HEAD | tar -xf - -C "$work/mb-printer-cli"
-git -C "$release_root/../mb-printer-sdk" archive HEAD | tar -xf - -C "$work/mb-printer-sdk"
 cargo install --path "$work/mb-printer-cli" --root "$work/install" --locked --features "$features"
 test "$("$work/install/bin/mb-printer" --version)" = "mb-printer $version"
 

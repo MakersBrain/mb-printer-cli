@@ -10,10 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - id: sdk
+        run: echo "ref=$(tr -d '[:space:]' < .github/sdk-ref)" >> "$GITHUB_OUTPUT"
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
         with:
           repository: makersbrain/mb-printer-sdk
           path: _sdk
+          ref: '${{ steps.sdk.outputs.ref }}'
+          fetch-depth: 0
+      - run: test "$(git -C _sdk rev-parse HEAD)" = "${{ steps.sdk.outputs.ref }}" && scripts/check_sdk_pin.sh _sdk
       - run: ln -s "$GITHUB_WORKSPACE/_sdk" "$GITHUB_WORKSPACE/../mb-printer-sdk"
       - run: rustup toolchain install 1.92.0 --profile minimal --component rustfmt --component clippy && rustup default 1.92.0
       - run: test "$(rustc --version | cut -d' ' -f2)" = 1.92.0
