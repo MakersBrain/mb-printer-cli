@@ -135,6 +135,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let bytes = if let Some(paper) = &args.paper {
                     raster::sheet_pdf(
                         &image,
+                        document.media.width,
+                        document.media.height,
                         args.dpi,
                         paper,
                         args.margin_mm,

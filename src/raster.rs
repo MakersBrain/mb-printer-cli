@@ -2,11 +2,15 @@
 //! Thin native wrappers around the authoritative SDK renderer and exporters.
 use mb_printer_core::{
     Document, export,
+    limits::ProcessingLimits,
     protocol::Raster,
     raster::MonoRaster,
     render::{self, RenderOptions},
+    sheet::{
+        FillOrder, SheetDefinition, SheetGrid, SheetOptions, SheetRasterItem, SheetRasterOptions,
+    },
 };
-use std::{io, path::Path};
+use std::{io, num::NonZeroU16, path::Path};
 
 pub fn render(document: &Document, dpi: u16) -> io::Result<MonoRaster> {
     render_with_dither(document, dpi, None)
@@ -185,6 +189,8 @@ pub fn fit_to_box(image: &MonoRaster, width: u32, height: u32) -> io::Result<Mon
 #[allow(clippy::too_many_arguments)]
 pub fn sheet_pdf(
     label: &MonoRaster,
+    label_width_um: i64,
+    label_height_um: i64,
     dpi: u16,
     paper: &str,
     margin_mm: f64,
@@ -202,61 +208,85 @@ pub fn sheet_pdf(
             ));
         }
     };
-    if margin_mm < 0.0 || gap_mm < 0.0 || columns == 0 || rows == 0 {
+    let dpi = NonZeroU16::new(dpi)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "dpi must be positive"))?;
+    let millimetres_to_micrometres = |value: f64| -> io::Result<i64> {
+        if !value.is_finite() || value < 0.0 || value > i64::MAX as f64 / 1_000.0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid sheet geometry",
+            ));
+        }
+        Ok((value * 1_000.0).round() as i64)
+    };
+    let margin_um = millimetres_to_micrometres(margin_mm)?;
+    let gap_um = millimetres_to_micrometres(gap_mm)?;
+    if columns == 0 || rows == 0 || label_width_um <= 0 || label_height_um <= 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "invalid sheet geometry",
         ));
     }
-    let dots = |mm: f64| (mm * f64::from(dpi) / 25.4).round() as u32;
-    let width = dots(paper_width_um as f64 / 1000.0);
-    let height = dots(paper_height_um as f64 / 1000.0);
-    let margin = dots(margin_mm);
-    let gap = dots(gap_mm);
-    let used_width = margin * 2 + u32::from(columns) * label.width + u32::from(columns - 1) * gap;
-    let used_height = margin * 2 + u32::from(rows) * label.height + u32::from(rows - 1) * gap;
-    if used_width > width || used_height > height {
+    let used_width_um = margin_um
+        .checked_mul(2)
+        .and_then(|value| {
+            i64::from(columns)
+                .checked_mul(label_width_um)?
+                .checked_add(value)
+        })
+        .and_then(|value| {
+            i64::from(columns - 1)
+                .checked_mul(gap_um)?
+                .checked_add(value)
+        });
+    let used_height_um = margin_um
+        .checked_mul(2)
+        .and_then(|value| {
+            i64::from(rows)
+                .checked_mul(label_height_um)?
+                .checked_add(value)
+        })
+        .and_then(|value| i64::from(rows - 1).checked_mul(gap_um)?.checked_add(value));
+    if used_width_um.is_none_or(|value| value > paper_width_um)
+        || used_height_um.is_none_or(|value| value > paper_height_um)
+    {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "label grid does not fit sheet",
         ));
     }
-    let mut pixels = vec![0; (width * height) as usize];
-    for row in 0..u32::from(rows) {
-        for column in 0..u32::from(columns) {
-            let left = margin + column * (label.width + gap);
-            let top = margin + row * (label.height + gap);
-            for y in 0..label.height {
-                let destination = ((top + y) * width + left) as usize;
-                let source = (y * label.width) as usize;
-                pixels[destination..destination + label.width as usize]
-                    .copy_from_slice(&label.pixels[source..source + label.width as usize]);
-            }
-            if cut_marks {
-                let length = dots(2.0).max(1);
-                for delta in 0..length {
-                    for (x, y) in [
-                        (left.saturating_sub(delta), top),
-                        (left, top.saturating_sub(delta)),
-                        (left + label.width + delta, top),
-                        (left, top + label.height + delta),
-                    ] {
-                        if x < width && y < height {
-                            pixels[(y * width + x) as usize] = 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
-    export::pdf_physical(
-        &MonoRaster {
-            width,
-            height,
-            pixels,
+    let definition = SheetDefinition::Grid {
+        grid: SheetGrid {
+            id: format!("cli-{paper}"),
+            paper_width_um,
+            paper_height_um,
+            rows,
+            columns,
+            label_width_um,
+            label_height_um,
+            margin_left_um: margin_um,
+            margin_top_um: margin_um,
+            gap_x_um: gap_um,
+            gap_y_um: gap_um,
+            fill_order: FillOrder::RowMajor,
         },
-        paper_width_um,
-        paper_height_um,
+    };
+    let item_count = usize::from(rows)
+        .checked_mul(usize::from(columns))
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid sheet geometry"))?;
+    let items = (0..item_count)
+        .map(|_| SheetRasterItem {
+            raster: label,
+            width_um: label_width_um,
+            height_um: label_height_um,
+        })
+        .collect::<Vec<_>>();
+    mb_printer_core::sheet::pdf_rasters(
+        &items,
+        &definition,
+        SheetOptions { first_slot: 0, dpi },
+        SheetRasterOptions { cut_marks },
+        &ProcessingLimits::default(),
     )
     .map_err(io::Error::other)
 }
@@ -313,8 +343,11 @@ mod tests {
             pixels: vec![1; 50],
         };
         assert_eq!(scale_to_width(&raster, 4).unwrap().height, 2);
-        let pdf = sheet_pdf(&raster, 203, "a4", 5.0, 2.0, 2, 2, true).unwrap();
+        let pdf = sheet_pdf(&raster, 1_251, 626, 203, "a4", 5.0, 2.0, 2, 2, true).unwrap();
+        let without_cut_marks =
+            sheet_pdf(&raster, 1_251, 626, 203, "a4", 5.0, 2.0, 2, 2, false).unwrap();
         assert!(String::from_utf8_lossy(&pdf).contains("/MediaBox [0 0 595.275591 841.889764]"));
+        assert_ne!(pdf, without_cut_marks);
     }
 
     #[test]

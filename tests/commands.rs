@@ -164,8 +164,40 @@ fn legacy_direct_inputs_rotation_fit_and_sheet_export_execute() {
         String::from_utf8_lossy(&export.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&fs::read(sheet).unwrap())
+        String::from_utf8_lossy(&fs::read(&sheet).unwrap())
             .contains("/MediaBox [0 0 595.275591 841.889764]")
+    );
+    assert!(
+        String::from_utf8_lossy(&fs::read(&sheet).unwrap()).contains("/Width 1678 /Height 2374")
+    );
+
+    let high_dpi_sheet = directory.path().join("sheet-300dpi.pdf");
+    let high_dpi_export = Command::new(binary)
+        .args([
+            "export",
+            input.to_str().unwrap(),
+            "-o",
+            high_dpi_sheet.to_str().unwrap(),
+            "--dpi",
+            "300",
+            "--paper",
+            "a4",
+            "--columns",
+            "2",
+            "--rows",
+            "2",
+            "--cut-marks",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        high_dpi_export.status.success(),
+        "{}",
+        String::from_utf8_lossy(&high_dpi_export.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&fs::read(high_dpi_sheet).unwrap())
+            .contains("/Width 2480 /Height 3508")
     );
 
     let svg = directory.path().join("wide.svg");
