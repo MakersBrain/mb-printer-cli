@@ -156,11 +156,23 @@ pub struct NativeDevice {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ieee1284_device_id: Option<String>,
 }
+fn serial_port_is_present(name: &str) -> bool {
+    #[cfg(unix)]
+    {
+        Path::new(name).exists()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = name;
+        true
+    }
+}
 pub fn discover_native() -> io::Result<Vec<NativeDevice>> {
     #[allow(unused_mut)]
     let mut found = serialport::available_ports()
         .map_err(io::Error::other)?
         .into_iter()
+        .filter(|port| serial_port_is_present(&port.port_name))
         .map(|p| NativeDevice {
             transport: "serial".into(),
             address: p.port_name,
@@ -254,50 +266,57 @@ pub mod bluetooth {
                     .start_scan(ScanFilter::default())
                     .await
                     .map_err(io::Error::other)?;
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                for peripheral in adapter.peripherals().await.map_err(io::Error::other)? {
-                    if peripheral
-                        .address()
-                        .to_string()
-                        .eq_ignore_ascii_case(address)
-                    {
-                        peripheral.connect().await.map_err(io::Error::other)?;
-                        peripheral
-                            .discover_services()
-                            .await
-                            .map_err(io::Error::other)?;
-                        let chars = peripheral.characteristics();
-                        let write = chars
-                            .iter()
-                            .find(|c| {
-                                c.properties.intersects(
-                                    CharPropFlags::WRITE | CharPropFlags::WRITE_WITHOUT_RESPONSE,
-                                )
-                            })
-                            .cloned()
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::NotFound,
-                                    "BLE write characteristic not found",
-                                )
-                            })?;
-                        let notify = chars
-                            .iter()
-                            .find(|c| c.properties.contains(CharPropFlags::NOTIFY))
-                            .cloned();
-                        return Ok(Self {
-                            handle: Handle::current(),
-                            peripheral,
-                            write,
-                            notify,
-                            notifications: None,
-                            payload_limit: crate::device::ble_payload_limit(
-                                user_cap,
-                                reported_write_limit,
-                                None,
-                            ),
-                        });
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+                loop {
+                    for peripheral in adapter.peripherals().await.map_err(io::Error::other)? {
+                        if peripheral
+                            .address()
+                            .to_string()
+                            .eq_ignore_ascii_case(address)
+                        {
+                            peripheral.connect().await.map_err(io::Error::other)?;
+                            peripheral
+                                .discover_services()
+                                .await
+                                .map_err(io::Error::other)?;
+                            let chars = peripheral.characteristics();
+                            let write = chars
+                                .iter()
+                                .find(|c| {
+                                    c.properties.intersects(
+                                        CharPropFlags::WRITE
+                                            | CharPropFlags::WRITE_WITHOUT_RESPONSE,
+                                    )
+                                })
+                                .cloned()
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::NotFound,
+                                        "BLE write characteristic not found",
+                                    )
+                                })?;
+                            let notify = chars
+                                .iter()
+                                .find(|c| c.properties.contains(CharPropFlags::NOTIFY))
+                                .cloned();
+                            return Ok(Self {
+                                handle: Handle::current(),
+                                peripheral,
+                                write,
+                                notify,
+                                notifications: None,
+                                payload_limit: crate::device::ble_payload_limit(
+                                    user_cap,
+                                    reported_write_limit,
+                                    None,
+                                ),
+                            });
+                        }
                     }
+                    if tokio::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
                 }
             }
             Err(io::Error::new(
