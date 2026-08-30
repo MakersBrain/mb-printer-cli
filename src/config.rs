@@ -26,7 +26,35 @@ pub struct Config {
     #[serde(default)]
     pub jobs_path: Option<PathBuf>,
     #[serde(default)]
+    pub cloud: Option<CloudConfig>,
+    #[serde(default)]
     pub printer_defaults: PrinterDefaults,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudConfig {
+    pub server: String,
+    pub agent_id: uuid::Uuid,
+    pub token_path: PathBuf,
+    pub jobs_path: PathBuf,
+    #[serde(default)]
+    pub printers: Vec<CloudPrinter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloudPrinter {
+    pub id: uuid::Uuid,
+    pub connection_id: String,
+    pub name: String,
+    pub model: String,
+    #[serde(default = "enabled")]
+    pub enabled: bool,
+}
+
+const fn enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -113,6 +141,7 @@ impl Default for Config {
             catalogue_path: None,
             connections_path: None,
             jobs_path: None,
+            cloud: None,
             printer_defaults: PrinterDefaults::default(),
         }
     }

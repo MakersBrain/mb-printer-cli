@@ -22,6 +22,7 @@ an implicit UI default:
 ```json
 {"kind":"capture"}
 {"kind":"tcp","address":"printer.local:9100"}
+{"kind":"ipp","uri":"ipps://brother.local:631/ipp/print"}
 {"kind":"serial","path":"/dev/ttyUSB0","baud":115200}
 {"kind":"rfcomm","address":"D3:8C:9F:86:F4:AA","channel":1}
 {"kind":"file","path":"/tmp/job.bin"}
@@ -40,7 +41,7 @@ for different request bytes returns HTTP 409 and never starts a write.
 Bounded job state and resumable request metadata persist at `jobs_path`.
 Interrupted non-terminal work is restored as `outcome-unknown`; completed and
 cancelled jobs remain queryable after restart. Saved connections dispatch the
-same TCP, serial, RFCOMM, file, feature-gated USB, or feature-gated BLE adapter
+same TCP, IPP/IPPS, serial, RFCOMM, file, feature-gated USB, or feature-gated BLE adapter
 as an explicit request.
 
 Browser preflights receive `Access-Control-Allow-Origin` only for an exact
@@ -53,7 +54,11 @@ of CORS response headers.
 
 `POST /v1/connection` persists a bounded connection definition. Discovery and
 `GET /v1/status?connection=ID` expose live backend-reported transport, status
-and media data. Brother TCP uses IPP by default (or raster status when
+and media data. A persisted `kind: "ipp"` connection uses the same endpoint for
+Get-Printer-Attributes status and Brother raster Print-Job submission. `ipps://`
+uses mandatory hostname and certificate verification; private or self-signed
+printer certificates can be added explicitly with `certificatePem`, and there
+is no insecure TLS or silent downgrade mode. Brother TCP uses IPP by default (or raster status when
 `statusMode` is `raster`); readable serial, USB, BLE and RFCOMM transports use
 the Brother status frame. Test-only injected probes remain available without
 claiming physical hardware acceptance.

@@ -12,11 +12,12 @@ only as salted hashes.
 
 The CLI validates strict v4 documents through `mb-printer-core`, creates PNG
 previews plus PDF/SVG/tiled exports, generates the SDK's timed protocol plans, and executes them through
-capture, file, TCP, or serial-device transports. For example:
+capture, file, TCP, verified IPPS/IPP, or serial-device transports. For example:
 
 ```sh
 mb-printer print label.mb-label.json --model m110 --dry-run --capture job.json
 mb-printer print label.mb-label.json --model tspl-generic --transport tcp://printer:9100
+mb-printer print label.mb-label.json --model ql-1110nwb --transport ipps://brother.local:631/ipp/print
 ```
 
 Build with `--features usb` for libusb bulk discovery/execution, or

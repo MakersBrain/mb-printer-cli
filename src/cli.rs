@@ -60,6 +60,10 @@ pub enum Command {
         #[command(subcommand)]
         command: ApiCommand,
     },
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -346,6 +350,25 @@ pub enum ApiCommand {
         #[arg(long, default_value_t = 2_592_000)]
         expires_seconds: u64,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CloudCommand {
+    Enroll {
+        #[arg(long)]
+        server: String,
+    },
+    Publish {
+        #[arg(long)]
+        connection: String,
+        #[arg(long)]
+        name: String,
+    },
+    Unpublish {
+        printer_id: uuid::Uuid,
+    },
+    Status,
+    Connect,
 }
 
 #[cfg(test)]

@@ -7,7 +7,9 @@ versioned path and a migration note.
 
 ## Unreleased
 
-No changes yet.
+- Added persisted IPP/IPPS loopback-service connections with live printer/media
+  status, Brother raster Print-Job execution, verified TLS, and explicit private
+  certificate trust.
 
 ## 0.1.0
 

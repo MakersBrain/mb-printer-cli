@@ -8,6 +8,8 @@ use std::{
     time::Duration,
 };
 
+const MAX_IPP_RESPONSE_BYTES: u64 = 1024 * 1024;
+
 const PJL_HEADER: &[u8] = b"\x1b%-12345X@PJL\r\n";
 const PJL_FOOTER: &[u8] = b"\x1b%-12345X";
 const PASSWORD_KEY: [u8; 16] = [
@@ -380,6 +382,140 @@ pub fn ipp_request(uri: &str) -> Vec<u8> {
     body.push(3);
     body
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IppEndpoint {
+    pub uri: String,
+    pub certificate_pem: Option<String>,
+}
+
+impl IppEndpoint {
+    pub fn new(uri: impl Into<String>, certificate_pem: Option<String>) -> std::io::Result<Self> {
+        let mut parsed = validate_ipp_uri(&uri.into())?;
+        if parsed.path().is_empty() || parsed.path() == "/" {
+            parsed.set_path("/ipp/print");
+        }
+        Ok(Self {
+            uri: parsed.to_string(),
+            certificate_pem,
+        })
+    }
+}
+
+fn validate_ipp_uri(uri: &str) -> std::io::Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(uri)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid IPP URI"))?;
+    if !matches!(parsed.scheme(), "ipp" | "ipps")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "IPP URI must use ipp:// or ipps:// without credentials, query, or fragment",
+        ));
+    }
+    Ok(parsed)
+}
+
+fn ipp_http_url(uri: &str) -> std::io::Result<reqwest::Url> {
+    let source = validate_ipp_uri(uri)?;
+    let transport_scheme = if source.scheme() == "ipps" {
+        "https"
+    } else {
+        "http"
+    };
+    let host = source
+        .host()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid IPP host"))?;
+    let port = source.port().unwrap_or(631);
+    let path = if source.path().is_empty() || source.path() == "/" {
+        "/ipp/print"
+    } else {
+        source.path()
+    };
+    reqwest::Url::parse(&format!("{transport_scheme}://{host}:{port}{path}")).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid IPP transport URI",
+        )
+    })
+}
+
+fn ipp_post(endpoint: &IppEndpoint, body: Vec<u8>, timeout: Duration) -> std::io::Result<Vec<u8>> {
+    let url = ipp_http_url(&endpoint.uri)?;
+    if url.scheme() == "http" && endpoint.certificate_pem.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "a trusted certificate can only be configured for IPPS",
+        ));
+    }
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy();
+    if let Some(pem) = &endpoint.certificate_pem {
+        let certificate = reqwest::Certificate::from_pem(pem.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid trusted IPPS certificate PEM",
+            )
+        })?;
+        builder = builder.add_root_certificate(certificate);
+    }
+    let client = builder
+        .build()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    let response = client
+        .post(url)
+        .header(reqwest::header::CONTENT_TYPE, "application/ipp")
+        .header(reqwest::header::ACCEPT, "application/ipp")
+        .body(body)
+        .send()
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if !response.status().is_success() {
+        return Err(std::io::Error::other(format!(
+            "IPP HTTP request failed with {}",
+            response.status()
+        )));
+    }
+    if response
+        .headers()
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > MAX_IPP_RESPONSE_BYTES)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IPP HTTP response exceeds 1 MiB",
+        ));
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_IPP_RESPONSE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_IPP_RESPONSE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IPP HTTP response exceeds 1 MiB",
+        ));
+    }
+    if bytes.len() < 8 || u16::from_be_bytes([bytes[2], bytes[3]]) > 0x00ff {
+        return Err(std::io::Error::other("IPP operation was rejected"));
+    }
+    Ok(bytes)
+}
+
+pub fn ipp_query_endpoint(
+    endpoint: &IppEndpoint,
+    timeout: Duration,
+) -> std::io::Result<BTreeMap<String, Vec<IppValue>>> {
+    let body = ipp_request(&endpoint.uri);
+    ipp_post(endpoint, body, timeout).map(|response| parse_ipp(&response))
+}
 pub fn ipp_query(
     host: &str,
     port: u16,
@@ -527,6 +663,36 @@ pub fn ipp_print_job(
     }
     Ok(parse_ipp(ipp))
 }
+
+pub fn ipp_print_job_endpoint(
+    endpoint: &IppEndpoint,
+    document: &[u8],
+    media: &str,
+    timeout: Duration,
+) -> std::io::Result<BTreeMap<String, Vec<IppValue>>> {
+    validate_ipp_uri(&endpoint.uri)?;
+    let mut body = vec![2, 0, 0, 2, 0, 0, 0, 1, 1];
+    body.extend(ipp_attr(0x47, "attributes-charset", "utf-8"));
+    body.extend(ipp_attr(0x48, "attributes-natural-language", "en"));
+    body.extend(ipp_attr(0x45, "printer-uri", &endpoint.uri));
+    body.extend(ipp_attr(0x42, "requesting-user-name", "mb-printer"));
+    body.extend(ipp_attr(0x42, "job-name", "mb-printer-label"));
+    body.extend(ipp_attr(
+        0x49,
+        "document-format",
+        "application/octet-stream",
+    ));
+    body.push(2);
+    body.extend(ipp_attr(0x44, "media", media));
+    body.push(0x21);
+    body.extend(("copies".len() as u16).to_be_bytes());
+    body.extend(b"copies");
+    body.extend(4_u16.to_be_bytes());
+    body.extend(1_i32.to_be_bytes());
+    body.push(3);
+    body.extend(document);
+    ipp_post(endpoint, body, timeout).map(|response| parse_ipp(&response))
+}
 fn http_content_complete(response: &[u8]) -> bool {
     let Some(split) = response.windows(4).position(|part| part == b"\r\n\r\n") else {
         return false;
@@ -622,6 +788,35 @@ mod tests {
         assert_eq!(ble_payload_limit(600, None, Some(517)), 514);
         assert_eq!(ble_payload_limit(128, Some(244), Some(517)), 128);
     }
+
+    #[test]
+    fn ipp_endpoint_validation_is_secure_by_default() {
+        let endpoint = IppEndpoint::new("ipps://printer.local", None).unwrap();
+        assert_eq!(endpoint.uri, "ipps://printer.local/ipp/print");
+        assert_eq!(
+            ipp_http_url(&endpoint.uri).unwrap().as_str(),
+            "https://printer.local:631/ipp/print"
+        );
+        assert!(IppEndpoint::new("https://printer.local/ipp/print", None).is_err());
+        assert!(IppEndpoint::new("ipps://user@printer.local/ipp/print", None).is_err());
+        let plain_with_certificate = IppEndpoint::new(
+            "ipp://127.0.0.1:9/ipp/print",
+            Some("not used for plain IPP".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            ipp_query_endpoint(&plain_with_certificate, Duration::from_millis(10))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+        let invalid_certificate = IppEndpoint::new(
+            "ipps://127.0.0.1:9/ipp/print",
+            Some("not a PEM certificate".into()),
+        )
+        .unwrap();
+        assert!(ipp_query_endpoint(&invalid_certificate, Duration::from_millis(10)).is_err());
+    }
     #[test]
     fn live_ipp_client_uses_http_and_decodes_media() {
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -677,7 +872,12 @@ mod tests {
             stream.write_all(&body).unwrap();
             std::thread::sleep(Duration::from_millis(150));
         });
-        let attributes = ipp_query("127.0.0.1", address.port(), Duration::from_millis(50)).unwrap();
+        let endpoint = IppEndpoint::new(
+            format!("ipp://127.0.0.1:{}/ipp/print", address.port()),
+            None,
+        )
+        .unwrap();
+        let attributes = ipp_query_endpoint(&endpoint, Duration::from_millis(50)).unwrap();
         server.join().unwrap();
         assert_eq!(
             attributes["media-ready"],
@@ -731,9 +931,13 @@ mod tests {
             .unwrap();
             stream.write_all(&response).unwrap();
         });
-        ipp_print_job(
-            "127.0.0.1",
-            address.port(),
+        let endpoint = IppEndpoint::new(
+            format!("ipp://127.0.0.1:{}/ipp/print", address.port()),
+            None,
+        )
+        .unwrap();
+        ipp_print_job_endpoint(
+            &endpoint,
             document,
             "om_label_62x29mm",
             Duration::from_secs(1),

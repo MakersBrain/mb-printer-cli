@@ -5,8 +5,8 @@ use mb_printer_cli::{
     assets,
     auth::{self, AuthStore},
     cli::{
-        ApiCommand, AssetCommand, Cli, Command, ConfigCommand, DocumentCommand, UsbCommand,
-        WifiCommand,
+        ApiCommand, AssetCommand, Cli, CloudCommand, Command, ConfigCommand, DocumentCommand,
+        UsbCommand, WifiCommand,
     },
     config, laposte, raster,
     transport::{
@@ -664,6 +664,101 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Command::Cloud { command } => match command {
+            CloudCommand::Enroll { server } => {
+                use std::io::BufRead as _;
+                eprint!("enrollment code: ");
+                let mut code = String::new();
+                std::io::stdin().lock().read_line(&mut code)?;
+                let code = code.trim();
+                if code.is_empty() {
+                    return Err("enrollment code is required".into());
+                }
+                let enrollment = mb_printer_cli::cloud::agent::enroll(&server, code).await?;
+                let directory = config_path.parent().unwrap_or_else(|| Path::new("."));
+                let token_path = directory.join("cloud-token");
+                let jobs_path = directory.join("cloud-jobs.json");
+                mb_printer_cli::cloud::agent::save_token(&token_path, &enrollment.token)?;
+                cfg.cloud = Some(config::CloudConfig {
+                    server: enrollment.agent_url,
+                    agent_id: enrollment.agent_id,
+                    token_path,
+                    jobs_path,
+                    printers: Vec::new(),
+                });
+                config::save(&config_path, &cfg)?;
+                println!("enrolled cloud agent {}", enrollment.agent_id);
+            }
+            CloudCommand::Publish { connection, name } => {
+                if name.trim().is_empty() || name.len() > 120 {
+                    return Err("cloud printer name must contain 1 to 120 characters".into());
+                }
+                let path = cfg
+                    .connections_path
+                    .as_ref()
+                    .ok_or("connections_path is not configured")?;
+                let connections: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(path)?)?;
+                let saved = connections
+                    .iter()
+                    .find(|item| item["id"].as_str() == Some(connection.as_str()))
+                    .ok_or("saved connection not found")?;
+                let model = saved["model"]
+                    .as_str()
+                    .filter(|model| capabilities::by_id(model).is_some())
+                    .ok_or("saved connection has an unknown printer model")?
+                    .to_owned();
+                let cloud = cfg.cloud.as_mut().ok_or("cloud agent is not enrolled")?;
+                if cloud
+                    .printers
+                    .iter()
+                    .any(|printer| printer.connection_id == connection)
+                {
+                    return Err("saved connection is already published".into());
+                }
+                let printer = config::CloudPrinter {
+                    id: uuid::Uuid::new_v4(),
+                    connection_id: connection,
+                    name: name.trim().to_owned(),
+                    model,
+                    enabled: true,
+                };
+                let id = printer.id;
+                cloud.printers.push(printer);
+                config::save(&config_path, &cfg)?;
+                println!("{id}");
+            }
+            CloudCommand::Unpublish { printer_id } => {
+                let cloud = cfg.cloud.as_mut().ok_or("cloud agent is not enrolled")?;
+                let original = cloud.printers.len();
+                cloud.printers.retain(|printer| printer.id != printer_id);
+                if cloud.printers.len() == original {
+                    return Err("published printer not found".into());
+                }
+                config::save(&config_path, &cfg)?;
+            }
+            CloudCommand::Status => {
+                let cloud = cfg.cloud.as_ref().ok_or("cloud agent is not enrolled")?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "server":cloud.server,
+                        "agentId":cloud.agent_id,
+                        "tokenConfigured":cloud.token_path.is_file(),
+                        "printers":cloud.printers,
+                    }))?
+                );
+            }
+            CloudCommand::Connect => {
+                let cloud = cfg.cloud.clone().ok_or("cloud agent is not enrolled")?;
+                let mut executor_config = cfg.clone();
+                executor_config.jobs_path = None;
+                let state = ApiState::new(
+                    AuthStore::load(auth::store_path(&config_path))?,
+                    executor_config,
+                );
+                mb_printer_cli::cloud::agent::run(cloud, state, cfg.max_document_bytes).await?;
+            }
+        },
     }
     Ok(())
 }
@@ -1203,15 +1298,19 @@ async fn execute_plan(
     let progress = if let Some(path) = uri.strip_prefix("file:") {
         let mut target = WriteTransport::file(Path::new(path), options.payload_limit)?;
         mb_printer_native::execute(plan, &mut target)?
-    } else if let Some(address) = uri.strip_prefix("ipp://") {
-        execute_ipp_plan(plan, address, options.payload_limit)?
+    } else if uri.starts_with("ipp://") || uri.starts_with("ipps://") {
+        execute_ipp_plan(plan, uri, options.payload_limit)?
     } else if let Some(address) = uri.strip_prefix("tcp://") {
         if plan.protocol == mb_printer_core::capabilities::Protocol::Brother
             && address
                 .rsplit_once(':')
                 .is_some_and(|(_, port)| port == "631")
         {
-            execute_ipp_plan(plan, address, options.payload_limit)?
+            execute_ipp_plan(
+                plan,
+                &format!("ipp://{address}/ipp/print"),
+                options.payload_limit,
+            )?
         } else {
             let mut target =
                 TcpTransport::connect(address, options.payload_limit, Duration::from_secs(5))?;
@@ -1284,7 +1383,8 @@ async fn execute_plan(
         }
     } else {
         return Err(
-            "transport must use file:, tcp://, ipp://, serial:, rfcomm:, ble:, or usb:".into(),
+            "transport must use file:, tcp://, ipp://, ipps://, serial:, rfcomm:, ble:, or usb:"
+                .into(),
         );
     };
     eprintln!(
@@ -1296,23 +1396,22 @@ async fn execute_plan(
 
 fn execute_ipp_plan(
     plan: &Plan,
-    address: &str,
+    uri: &str,
     payload_limit: usize,
 ) -> Result<mb_printer_native::Progress, Box<dyn std::error::Error>> {
     if plan.protocol != mb_printer_core::capabilities::Protocol::Brother {
         return Err("IPP octet-stream printing currently requires a Brother raster plan".into());
     }
-    let (host, port) = match address.rsplit_once(':') {
-        Some((host, port)) => (host, port.parse()?),
-        None => (address, 631),
-    };
-    let attributes = mb_printer_cli::device::ipp_query(host, port, Duration::from_secs(5))?;
+    let endpoint = mb_printer_cli::device::IppEndpoint::new(uri, None)?;
+    let attributes = mb_printer_cli::device::ipp_query_endpoint(&endpoint, Duration::from_secs(5))?;
     let media = attributes
         .get("media-ready")
-        .and_then(|values| values.first())
-        .and_then(|value| match value {
-            mb_printer_cli::device::IppValue::Text(value) => Some(value.as_str()),
-            mb_printer_cli::device::IppValue::Integer(_) => None,
+        .or_else(|| attributes.get("media-default"))
+        .and_then(|values| {
+            values.iter().find_map(|value| match value {
+                mb_printer_cli::device::IppValue::Text(value) => Some(value.clone()),
+                mb_printer_cli::device::IppValue::Integer(_) => None,
+            })
         })
         .ok_or("IPP printer did not report loaded media")?;
     let mut capture = CaptureTransport::new(payload_limit);
@@ -1330,11 +1429,10 @@ fn execute_ipp_plan(
         .flatten()
         .copied()
         .collect::<Vec<_>>();
-    let result = mb_printer_cli::device::ipp_print_job(
-        host,
-        port,
+    let result = mb_printer_cli::device::ipp_print_job_endpoint(
+        &endpoint,
         &document,
-        media,
+        &media,
         Duration::from_secs(15),
     )?;
     let job_id = result

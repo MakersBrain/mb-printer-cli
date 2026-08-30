@@ -35,7 +35,7 @@ use crate::{
     config::Config,
     jobs::{Job, JobState},
     raster,
-    transport::{CaptureTransport, SerialTransport, TcpTransport, WriteTransport},
+    transport::{CaptureTransport, PhysicalEvent, SerialTransport, TcpTransport, WriteTransport},
 };
 use mb_printer_core::{
     Document, capabilities,
@@ -50,6 +50,7 @@ pub struct ApiState {
     events: Arc<RwLock<HashMap<Uuid, broadcast::Sender<Job>>>>,
     cancellations: Arc<RwLock<HashMap<Uuid, Arc<AtomicBool>>>>,
     connections: Arc<RwLock<HashMap<String, Connection>>>,
+    connection_executions: Arc<RwLock<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
     injected_devices: Arc<RwLock<Vec<crate::transport::NativeDevice>>>,
     injected_probes: Arc<RwLock<HashMap<String, ProbeResult>>>,
 }
@@ -91,6 +92,7 @@ impl ApiState {
             events: Arc::new(RwLock::new(HashMap::new())),
             cancellations: Arc::new(RwLock::new(HashMap::new())),
             connections: Arc::new(RwLock::new(connections)),
+            connection_executions: Arc::new(RwLock::new(HashMap::new())),
             injected_devices: Arc::new(RwLock::new(Vec::new())),
             injected_probes: Arc::new(RwLock::new(HashMap::new())),
         }
@@ -117,6 +119,59 @@ impl ApiState {
             .write()
             .await
             .insert(id.to_owned(), result);
+    }
+
+    pub(crate) async fn submit_cloud_job(
+        &self,
+        id: Uuid,
+        connection_id: &str,
+        request: &crate::cloud::store::CloudPrintRequest,
+        request_hash: &str,
+    ) -> Result<Job, ApiError> {
+        let mut value = serde_json::to_value(request).map_err(|_| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "cloud job request is invalid",
+            )
+        })?;
+        value
+            .as_object_mut()
+            .expect("cloud print request serializes as an object")
+            .insert(
+                "connectionId".into(),
+                serde_json::Value::String(connection_id.to_owned()),
+            );
+        let body = Bytes::from(serde_json::to_vec(&value).map_err(|_| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "cloud job request is invalid",
+            )
+        })?);
+        JobExecutor::new(self.clone())
+            .submit(
+                body,
+                Some(format!("cloud\0{id}")),
+                request_hash.to_owned(),
+                Some(id),
+            )
+            .await
+            .map(|outcome| outcome.job)
+    }
+
+    pub(crate) async fn cloud_job(&self, id: Uuid) -> Option<Job> {
+        self.jobs.read().await.get(&id).cloned()
+    }
+
+    pub(crate) async fn cancel_cloud_job(&self, id: Uuid) -> Option<Job> {
+        if let Some(cancel) = self.cancellations.read().await.get(&id) {
+            cancel.store(true, Ordering::Release);
+        }
+        let mut jobs = self.jobs.write().await;
+        let job = jobs.get_mut(&id)?;
+        job.request_cancel();
+        let result = job.clone();
+        let _ = save_jobs(self, &jobs);
+        Some(result)
     }
 }
 fn save_jobs(state: &ApiState, jobs: &HashMap<Uuid, Job>) -> Result<(), ApiError> {
@@ -180,7 +235,7 @@ fn save_connections(
 }
 
 #[derive(Debug)]
-struct ApiError(StatusCode, &'static str);
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
@@ -403,7 +458,7 @@ async fn capabilities(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers).await?;
     Ok(Json(
-        serde_json::json!({"service":"mb-printer","version":VERSION,"api":"v1","features":["documents","preview-png","jobs","job-idempotency","job-fit","self-service-grants","dual-stack-loopback","assets","laposte","file-transport","tcp-transport","serial-transport"],"max_document_bytes":state.config.max_document_bytes,"printer_definition_count":capabilities::bundled().len()}),
+        serde_json::json!({"service":"mb-printer","version":VERSION,"api":"v1","features":["documents","preview-png","jobs","job-idempotency","job-fit","self-service-grants","dual-stack-loopback","assets","laposte","file-transport","tcp-transport","serial-transport","ipp-transport","ipps-transport"],"max_document_bytes":state.config.max_document_bytes,"printer_definition_count":capabilities::bundled().len()}),
     ))
 }
 async fn printers(
@@ -449,7 +504,7 @@ async fn discovery(
     authorize(&state, &headers).await?;
     let devices = discovered_devices(&state).await;
     Ok(Json(
-        serde_json::json!({"devices":devices,"supportedTransports":["file","tcp","serial","usb","ble","rfcomm"]}),
+        serde_json::json!({"devices":devices,"supportedTransports":["file","tcp","serial","usb","ble","rfcomm","ipp"]}),
     ))
 }
 #[derive(Deserialize)]
@@ -479,7 +534,10 @@ async fn connection(
             StatusCode::UNPROCESSABLE_ENTITY,
             "transport kind is required",
         ))?;
-    if !matches!(kind, "file" | "tcp" | "serial" | "usb" | "ble" | "rfcomm") {
+    if !matches!(
+        kind,
+        "file" | "tcp" | "serial" | "usb" | "ble" | "rfcomm" | "ipp"
+    ) {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
             "unsupported transport",
@@ -512,6 +570,9 @@ async fn connection(
 }
 fn probe_transport(transport: &serde_json::Value) -> Result<ProbeResult, ApiError> {
     let kind = transport["kind"].as_str().unwrap_or_default();
+    if kind == "ipp" {
+        return ipp_status(transport);
+    }
     let result = match kind {
         "tcp" => transport["address"]
             .as_str()
@@ -725,7 +786,77 @@ fn brother_ipp_status(address: &str) -> Result<ProbeResult, ApiError> {
     })
 }
 
+fn ipp_endpoint(transport: &serde_json::Value) -> Result<crate::device::IppEndpoint, ApiError> {
+    let uri = transport["uri"].as_str().ok_or(ApiError(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "IPP URI required",
+    ))?;
+    let certificate_pem = transport["certificatePem"].as_str().map(str::to_owned);
+    crate::device::IppEndpoint::new(uri, certificate_pem).map_err(|_| {
+        ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "invalid IPP/IPPS endpoint",
+        )
+    })
+}
+
+fn ipp_status(transport: &serde_json::Value) -> Result<ProbeResult, ApiError> {
+    let endpoint = ipp_endpoint(transport)?;
+    let attributes = crate::device::ipp_query_endpoint(&endpoint, Duration::from_secs(3))
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "IPP/IPPS status failed"))?;
+    let text = |name: &str| {
+        attributes.get(name).and_then(|values| {
+            values.iter().find_map(|value| match value {
+                crate::device::IppValue::Text(value) => Some(value.clone()),
+                crate::device::IppValue::Integer(_) => None,
+            })
+        })
+    };
+    let integer = |name: &str| {
+        attributes.get(name).and_then(|values| {
+            values.iter().find_map(|value| match value {
+                crate::device::IppValue::Integer(value) => Some(*value),
+                crate::device::IppValue::Text(_) => None,
+            })
+        })
+    };
+    let keyword = text("media-ready").or_else(|| text("media-default"));
+    let size = keyword.as_deref().and_then(crate::device::ipp_media_size);
+    let state = match integer("printer-state") {
+        Some(3) => "idle",
+        Some(4) => "processing",
+        Some(5) => "stopped",
+        _ => "ready",
+    };
+    let reasons = attributes
+        .get("printer-state-reasons")
+        .into_iter()
+        .flatten()
+        .filter_map(|value| match value {
+            crate::device::IppValue::Text(value) => Some(value.clone()),
+            crate::device::IppValue::Integer(_) => None,
+        })
+        .collect::<Vec<_>>();
+    Ok(ProbeResult {
+        status: state.into(),
+        media: Some(serde_json::json!({
+            "keyword":keyword,
+            "widthMm":size.map(|size|size.0),
+            "lengthMm":size.map(|size|size.1),
+            "printerState":state,
+            "reasons":reasons,
+            "makeAndModel":text("printer-make-and-model")
+        })),
+    })
+}
+
 async fn printer_status_async(connection: &Connection) -> Result<ProbeResult, ApiError> {
+    if connection.transport["kind"] == "ipp" {
+        let transport = connection.transport.clone();
+        return tokio::task::spawn_blocking(move || ipp_status(&transport))
+            .await
+            .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "IPP status task crashed"))?;
+    }
     let Some(definition) = capabilities::by_id(&connection.model) else {
         return Err(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1025,6 +1156,11 @@ enum ApiTransport {
     Tcp {
         address: String,
     },
+    Ipp {
+        uri: String,
+        #[serde(default, rename = "certificatePem")]
+        certificate_pem: Option<String>,
+    },
     Serial {
         path: String,
         #[serde(default = "default_baud")]
@@ -1255,6 +1391,60 @@ fn execute_cancellable<T: mb_printer_native::Transport>(
         (error.to_string(), progress)
     })
 }
+
+fn execute_ipp_cancellable(
+    plan: &mb_printer_core::protocol::Plan,
+    uri: String,
+    certificate_pem: Option<String>,
+    payload_limit: usize,
+    cancel: Arc<AtomicBool>,
+) -> Result<mb_printer_native::Progress, (String, Option<mb_printer_native::Progress>)> {
+    if plan.protocol != mb_printer_core::capabilities::Protocol::Brother {
+        return Err((
+            "IPP octet-stream printing currently requires a Brother raster plan".into(),
+            None,
+        ));
+    }
+    let endpoint = crate::device::IppEndpoint::new(uri, certificate_pem)
+        .map_err(|error| (error.to_string(), None))?;
+    let attributes = crate::device::ipp_query_endpoint(&endpoint, Duration::from_secs(5))
+        .map_err(|error| (error.to_string(), None))?;
+    let media = attributes
+        .get("media-ready")
+        .or_else(|| attributes.get("media-default"))
+        .and_then(|values| {
+            values.iter().find_map(|value| match value {
+                crate::device::IppValue::Text(value) => Some(value.clone()),
+                crate::device::IppValue::Integer(_) => None,
+            })
+        })
+        .ok_or_else(|| ("IPP printer did not report loaded media".into(), None))?;
+    if cancel.load(Ordering::Acquire) {
+        return Err(("cancelled".into(), None));
+    }
+    let mut capture = CaptureTransport::new(payload_limit);
+    let mut response = vec![0; 32];
+    response[..3].copy_from_slice(&[0x80, 0x20, 0x42]);
+    capture.response = Some(response);
+    let progress = mb_printer_native::execute(plan, &mut capture)
+        .map_err(|error| (error.to_string(), None))?;
+    let document = capture
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            PhysicalEvent::Write { bytes } => Some(bytes.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    if cancel.load(Ordering::Acquire) {
+        return Err(("cancelled".into(), None));
+    }
+    crate::device::ipp_print_job_endpoint(&endpoint, &document, &media, Duration::from_secs(15))
+        .map_err(|error| (error.to_string(), Some(progress.clone())))?;
+    Ok(progress)
+}
 async fn submit_job(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -1289,357 +1479,473 @@ async fn submit_job(
             origin(&headers).expect("authorization already validated origin")
         )
     });
-    if let Some(key) = &scoped_key
-        && let Some(existing) = state
-            .jobs
-            .read()
-            .await
-            .values()
-            .find(|job| job.idempotency_key.as_deref() == Some(key))
-    {
-        if existing.request_hash.as_deref() != Some(&request_hash) {
-            return Err(ApiError(
-                StatusCode::CONFLICT,
-                "idempotency key was used for a different request",
-            ));
-        }
-        return Ok((StatusCode::OK, Json(JobView::from(existing))));
+    let outcome = JobExecutor::new(state)
+        .submit(body, scoped_key, request_hash, None)
+        .await?;
+    Ok((outcome.status, Json(JobView::from(&outcome.job))))
+}
+
+pub(crate) struct SubmitOutcome {
+    pub(crate) status: StatusCode,
+    pub(crate) job: Job,
+}
+
+/// One execution boundary shared by loopback HTTP submissions and cloud jobs.
+///
+/// Callers select an already configured connection in the request. Only this
+/// boundary resolves that connection into a native transport, validates and
+/// plans the document, persists the job, and starts physical execution.
+#[derive(Clone)]
+pub(crate) struct JobExecutor {
+    state: ApiState,
+}
+
+impl JobExecutor {
+    pub(crate) fn new(state: ApiState) -> Self {
+        Self { state }
     }
-    let request: JobRequest = serde_json::from_slice(&body)
-        .map_err(|_| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid job request"))?;
-    if !(1..=8).contains(&request.density) || request.copies == 0 || request.payload_limit == 0 {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid print options",
-        ));
-    }
-    if request.connection_id.is_some() == request.transport.is_some() {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "provide exactly one of connectionId or transport",
-        ));
-    }
-    let (model, transport, loaded_media) = if let Some(id) = &request.connection_id {
-        let connections = state.connections.read().await;
-        let connection = connections.get(id).ok_or(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "saved connection not found",
-        ))?;
-        if request
-            .model
-            .as_deref()
-            .is_some_and(|model| model != connection.model)
-        {
-            return Err(ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "printer model does not match saved connection",
-            ));
-        }
-        let transport = serde_json::from_value(connection.transport.clone()).map_err(|_| {
-            ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "saved connection transport is invalid",
-            )
-        })?;
-        (
-            connection.model.clone(),
-            transport,
-            connection.media.clone(),
-        )
-    } else {
-        (
-            request.model.clone().ok_or(ApiError(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "printerId/model is required",
-            ))?,
-            request.transport.clone().unwrap(),
-            None,
-        )
-    };
-    #[cfg(not(feature = "usb"))]
-    if matches!(transport, ApiTransport::Usb { .. }) {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "USB transport is unavailable in this build",
-        ));
-    }
-    #[cfg(not(feature = "bluetooth"))]
-    if matches!(transport, ApiTransport::Ble { .. }) {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "BLE transport is unavailable in this build",
-        ));
-    }
-    #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
-    if matches!(transport, ApiTransport::Rfcomm { .. }) {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "RFCOMM transport is unavailable in this build",
-        ));
-    }
-    let document = canonical_document(&request.document)?;
-    if document.validate().is_err() {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "document validation failed",
-        ));
-    }
-    let printer = capabilities::by_id(&model).ok_or(ApiError(
-        StatusCode::UNPROCESSABLE_ENTITY,
-        "unknown printer model",
-    ))?;
-    if !matches!(request.rotation, 0 | 90 | 180 | 270) {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "invalid rotation",
-        ));
-    }
-    let (document_width_mm, document_height_mm) = if matches!(request.rotation, 90 | 270) {
-        (
-            document.media.height as f64 / 1000.0,
-            document.media.width as f64 / 1000.0,
-        )
-    } else {
-        (
-            document.media.width as f64 / 1000.0,
-            document.media.height as f64 / 1000.0,
-        )
-    };
-    if !request.fit
-        && loaded_media.as_ref().is_some_and(|media| {
-            let width = media.get("widthMm").and_then(serde_json::Value::as_f64);
-            let length = media.get("lengthMm").and_then(serde_json::Value::as_f64);
-            width.is_some_and(|width| document_width_mm > width + 0.5)
-                || (!document.media.continuous
-                    && length.is_some_and(|length| document_height_mm > length + 0.5))
-        })
-    {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "document exceeds loaded media; set fit=true",
-        ));
-    }
-    let target_dpi = request.dpi.unwrap_or(printer.dpi);
-    let loaded_box = loaded_media.as_ref().and_then(|media| {
-        let width = media.get("widthMm")?.as_f64()?;
-        let height = media.get("lengthMm")?.as_f64()?;
-        if width <= 0.0 || height <= 0.0 || document.media.continuous {
-            return None;
-        }
-        Some((
-            (width * f64::from(target_dpi) / 25.4).round() as u32,
-            (height * f64::from(target_dpi) / 25.4).round() as u32,
-        ))
-    });
-    let packed = api_render_for_printer(
-        &document,
-        &printer,
-        target_dpi,
-        request.rotation,
-        request.fit,
-        loaded_box,
-    )?;
-    let plan = protocol::plan(
-        &printer,
-        &packed,
-        &Options {
-            density: request.density,
-            copies: request.copies,
-            continuous: document.media.continuous,
-            ..Options::default()
-        },
-    )
-    .map_err(|_| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "protocol plan failed"))?;
-    let mut job = Job::new();
-    job.idempotency_key = scoped_key;
-    job.request_hash = idempotency_key.map(|_| request_hash);
-    job.protocol = Some(format!("{:?}", printer.protocol).to_ascii_lowercase());
-    job.action_count = plan.actions.len();
-    job.total_bytes = plan
-        .actions
-        .iter()
-        .map(|action| match action {
-            mb_printer_core::protocol::Action::CommandWrite { bytes, .. }
-            | mb_printer_core::protocol::Action::RasterWrite { bytes, .. } => bytes.len() as u64,
-            _ => 0,
-        })
-        .sum();
-    job.resumable = Some(
-        serde_json::json!({"model":model,"connectionId":request.connection_id,"transport":request.transport,"document":request.document,"dpi":request.dpi,"rotation":request.rotation,"fit":request.fit,"density":request.density,"copies":request.copies,"payloadLimit":request.payload_limit}),
-    );
-    let (events, _) = broadcast::channel(32);
-    let cancel = Arc::new(AtomicBool::new(false));
-    let id = job.id;
-    {
-        let mut jobs = state.jobs.write().await;
-        if let Some(key) = &job.idempotency_key
-            && let Some(existing) = jobs
+
+    pub(crate) async fn submit(
+        &self,
+        body: Bytes,
+        scoped_key: Option<String>,
+        request_hash: String,
+        forced_job_id: Option<Uuid>,
+    ) -> Result<SubmitOutcome, ApiError> {
+        let state = self.state.clone();
+        if let Some(key) = &scoped_key
+            && let Some(existing) = state
+                .jobs
+                .read()
+                .await
                 .values()
-                .find(|existing| existing.idempotency_key.as_ref() == Some(key))
+                .find(|job| job.idempotency_key.as_deref() == Some(key))
         {
-            if existing.request_hash != job.request_hash {
+            if existing.request_hash.as_deref() != Some(&request_hash) {
                 return Err(ApiError(
                     StatusCode::CONFLICT,
                     "idempotency key was used for a different request",
                 ));
             }
-            return Ok((StatusCode::OK, Json(JobView::from(existing))));
+            return Ok(SubmitOutcome {
+                status: StatusCode::OK,
+                job: existing.clone(),
+            });
         }
-        if jobs.len() >= state.config.max_recent_jobs {
-            let removable = jobs
-                .values()
-                .filter(|job| job.terminal())
-                .min_by_key(|job| (job.updated_at_ms, job.id))
-                .map(|job| job.id);
-            if let Some(old_id) = removable {
-                jobs.remove(&old_id);
-            } else {
+        let request: JobRequest = serde_json::from_slice(&body)
+            .map_err(|_| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "invalid job request"))?;
+        if !(1..=8).contains(&request.density) || request.copies == 0 || request.payload_limit == 0
+        {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid print options",
+            ));
+        }
+        if request.connection_id.is_some() == request.transport.is_some() {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "provide exactly one of connectionId or transport",
+            ));
+        }
+        let (model, transport, loaded_media) = if let Some(id) = &request.connection_id {
+            let connections = state.connections.read().await;
+            let connection = connections.get(id).ok_or(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "saved connection not found",
+            ))?;
+            if request
+                .model
+                .as_deref()
+                .is_some_and(|model| model != connection.model)
+            {
                 return Err(ApiError(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "all retained jobs are active",
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "printer model does not match saved connection",
                 ));
             }
+            let transport = serde_json::from_value(connection.transport.clone()).map_err(|_| {
+                ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "saved connection transport is invalid",
+                )
+            })?;
+            (
+                connection.model.clone(),
+                transport,
+                connection.media.clone(),
+            )
+        } else {
+            (
+                request.model.clone().ok_or(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "printerId/model is required",
+                ))?,
+                request.transport.clone().unwrap(),
+                None,
+            )
+        };
+        #[cfg(not(feature = "usb"))]
+        if matches!(transport, ApiTransport::Usb { .. }) {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "USB transport is unavailable in this build",
+            ));
         }
-        jobs.insert(id, job.clone());
-        save_jobs(&state, &jobs)?;
-    }
-    state.events.write().await.insert(id, events.clone());
-    state.cancellations.write().await.insert(id, cancel.clone());
-    let accepted = job.clone();
-    let worker_state = state.clone();
-    #[cfg(feature = "bluetooth")]
-    let worker_runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        let mut running = job;
-        running.state = JobState::Running;
-        running.updated_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let _ = events.send(running.clone());
-        let execution = match transport {
-            ApiTransport::Capture => {
-                let mut target = CaptureTransport::new(request.payload_limit);
-                if matches!(
-                    printer.protocol,
-                    mb_printer_core::capabilities::Protocol::Brother
-                ) {
-                    let mut response = vec![0; 32];
-                    response[..3].copy_from_slice(&[0x80, 0x20, 0x42]);
-                    target.response = Some(response);
+        #[cfg(not(feature = "bluetooth"))]
+        if matches!(transport, ApiTransport::Ble { .. }) {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "BLE transport is unavailable in this build",
+            ));
+        }
+        #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+        if matches!(transport, ApiTransport::Rfcomm { .. }) {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "RFCOMM transport is unavailable in this build",
+            ));
+        }
+        let document = canonical_document(&request.document)?;
+        if document.validate().is_err() {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "document validation failed",
+            ));
+        }
+        let printer = capabilities::by_id(&model).ok_or(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "unknown printer model",
+        ))?;
+        if !matches!(request.rotation, 0 | 90 | 180 | 270) {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid rotation",
+            ));
+        }
+        let (document_width_mm, document_height_mm) = if matches!(request.rotation, 90 | 270) {
+            (
+                document.media.height as f64 / 1000.0,
+                document.media.width as f64 / 1000.0,
+            )
+        } else {
+            (
+                document.media.width as f64 / 1000.0,
+                document.media.height as f64 / 1000.0,
+            )
+        };
+        if !request.fit
+            && loaded_media.as_ref().is_some_and(|media| {
+                let width = media.get("widthMm").and_then(serde_json::Value::as_f64);
+                let length = media.get("lengthMm").and_then(serde_json::Value::as_f64);
+                width.is_some_and(|width| document_width_mm > width + 0.5)
+                    || (!document.media.continuous
+                        && length.is_some_and(|length| document_height_mm > length + 0.5))
+            })
+        {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "document exceeds loaded media; set fit=true",
+            ));
+        }
+        let target_dpi = request.dpi.unwrap_or(printer.dpi);
+        let loaded_box = loaded_media.as_ref().and_then(|media| {
+            let width = media.get("widthMm")?.as_f64()?;
+            let height = media.get("lengthMm")?.as_f64()?;
+            if width <= 0.0 || height <= 0.0 || document.media.continuous {
+                return None;
+            }
+            Some((
+                (width * f64::from(target_dpi) / 25.4).round() as u32,
+                (height * f64::from(target_dpi) / 25.4).round() as u32,
+            ))
+        });
+        let packed = api_render_for_printer(
+            &document,
+            &printer,
+            target_dpi,
+            request.rotation,
+            request.fit,
+            loaded_box,
+        )?;
+        let brother_media = if printer.protocol == mb_printer_core::capabilities::Protocol::Brother
+        {
+            let width = loaded_media
+                .as_ref()
+                .and_then(|media| media.get("widthMm"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(document_width_mm);
+            let length = loaded_media
+                .as_ref()
+                .and_then(|media| media.get("lengthMm"))
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(document_height_mm);
+            let preset = mb_printer_core::media::match_media(&printer, width, length);
+            Some(mb_printer_core::protocol::BrotherMedia {
+                width_mm: u8::try_from(width.round() as i64).map_err(|_| {
+                    ApiError(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        "Brother media width is invalid",
+                    )
+                })?,
+                length_mm: if document.media.continuous {
+                    0
+                } else {
+                    u8::try_from(length.round() as i64).map_err(|_| {
+                        ApiError(
+                            StatusCode::UNPROCESSABLE_ENTITY,
+                            "Brother media length is invalid",
+                        )
+                    })?
+                },
+                continuous: document.media.continuous,
+                feed_margin: preset
+                    .and_then(|media| media.feed_margin_dots)
+                    .and_then(|margin| u16::try_from(margin).ok())
+                    .unwrap_or_default(),
+            })
+        } else {
+            None
+        };
+        let plan = protocol::plan(
+            &printer,
+            &packed,
+            &Options {
+                density: request.density,
+                copies: request.copies,
+                continuous: document.media.continuous,
+                brother_media,
+                ..Options::default()
+            },
+        )
+        .map_err(|_| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "protocol plan failed"))?;
+        let mut job = Job::new();
+        if let Some(id) = forced_job_id {
+            job.id = id;
+        }
+        job.request_hash = scoped_key.as_ref().map(|_| request_hash);
+        job.idempotency_key = scoped_key;
+        job.protocol = Some(format!("{:?}", printer.protocol).to_ascii_lowercase());
+        job.action_count = plan.actions.len();
+        job.total_bytes = plan
+            .actions
+            .iter()
+            .map(|action| match action {
+                mb_printer_core::protocol::Action::CommandWrite { bytes, .. }
+                | mb_printer_core::protocol::Action::RasterWrite { bytes, .. } => {
+                    bytes.len() as u64
                 }
-                execute_cancellable(&plan, target, cancel.clone())
+                _ => 0,
+            })
+            .sum();
+        job.resumable = Some(
+            serde_json::json!({"model":model,"connectionId":request.connection_id,"transport":request.transport,"document":request.document,"dpi":request.dpi,"rotation":request.rotation,"fit":request.fit,"density":request.density,"copies":request.copies,"payloadLimit":request.payload_limit}),
+        );
+        let (events, _) = broadcast::channel(32);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let id = job.id;
+        {
+            let mut jobs = state.jobs.write().await;
+            if let Some(key) = &job.idempotency_key
+                && let Some(existing) = jobs
+                    .values()
+                    .find(|existing| existing.idempotency_key.as_ref() == Some(key))
+            {
+                if existing.request_hash != job.request_hash {
+                    return Err(ApiError(
+                        StatusCode::CONFLICT,
+                        "idempotency key was used for a different request",
+                    ));
+                }
+                return Ok(SubmitOutcome {
+                    status: StatusCode::OK,
+                    job: existing.clone(),
+                });
             }
-            ApiTransport::File { path } => {
-                WriteTransport::file(std::path::Path::new(&path), request.payload_limit)
-                    .map_err(|error| (error.to_string(), None))
+            if jobs.len() >= state.config.max_recent_jobs {
+                let removable = jobs
+                    .values()
+                    .filter(|job| job.terminal())
+                    .min_by_key(|job| (job.updated_at_ms, job.id))
+                    .map(|job| job.id);
+                if let Some(old_id) = removable {
+                    jobs.remove(&old_id);
+                } else {
+                    return Err(ApiError(
+                        StatusCode::TOO_MANY_REQUESTS,
+                        "all retained jobs are active",
+                    ));
+                }
+            }
+            jobs.insert(id, job.clone());
+            save_jobs(&state, &jobs)?;
+        }
+        state.events.write().await.insert(id, events.clone());
+        state.cancellations.write().await.insert(id, cancel.clone());
+        let execution_lock = if let Some(connection_id) = &request.connection_id {
+            let mut locks = state.connection_executions.write().await;
+            Some(
+                locks
+                    .entry(connection_id.clone())
+                    .or_insert_with(|| Arc::new(std::sync::Mutex::new(())))
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        let accepted = job.clone();
+        let worker_state = state.clone();
+        #[cfg(feature = "bluetooth")]
+        let worker_runtime = tokio::runtime::Handle::current();
+        tokio::task::spawn_blocking(move || {
+            let _connection_guard = execution_lock.as_ref().map(|lock| {
+                lock.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            });
+            let mut running = job;
+            running.state = JobState::Running;
+            running.updated_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let _ = events.send(running.clone());
+            let execution = match transport {
+                ApiTransport::Capture => {
+                    let mut target = CaptureTransport::new(request.payload_limit);
+                    if matches!(
+                        printer.protocol,
+                        mb_printer_core::capabilities::Protocol::Brother
+                    ) {
+                        let mut response = vec![0; 32];
+                        response[..3].copy_from_slice(&[0x80, 0x20, 0x42]);
+                        target.response = Some(response);
+                    }
+                    execute_cancellable(&plan, target, cancel.clone())
+                }
+                ApiTransport::File { path } => {
+                    WriteTransport::file(std::path::Path::new(&path), request.payload_limit)
+                        .map_err(|error| (error.to_string(), None))
+                        .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
+                }
+                ApiTransport::Tcp { address } => {
+                    TcpTransport::connect(&address, request.payload_limit, Duration::from_secs(5))
+                        .map_err(|error| (error.to_string(), None))
+                        .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
+                }
+                ApiTransport::Ipp {
+                    uri,
+                    certificate_pem,
+                } => execute_ipp_cancellable(
+                    &plan,
+                    uri,
+                    certificate_pem,
+                    request.payload_limit,
+                    cancel.clone(),
+                ),
+                ApiTransport::Serial { path, baud } => {
+                    SerialTransport::open(std::path::Path::new(&path), baud, request.payload_limit)
+                        .map_err(|error| (error.to_string(), None))
+                        .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
+                }
+                #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+                ApiTransport::Rfcomm { address, channel } => {
+                    mb_printer_native::transports::rfcomm::RfcommTransport::bind(
+                        0,
+                        &address,
+                        channel,
+                        request.payload_limit,
+                    )
+                    .map_err(|error| (error, None))
                     .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
-            }
-            ApiTransport::Tcp { address } => {
-                TcpTransport::connect(&address, request.payload_limit, Duration::from_secs(5))
-                    .map_err(|error| (error.to_string(), None))
-                    .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
-            }
-            ApiTransport::Serial { path, baud } => {
-                SerialTransport::open(std::path::Path::new(&path), baud, request.payload_limit)
-                    .map_err(|error| (error.to_string(), None))
-                    .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
-            }
-            #[cfg(all(feature = "bluetooth", target_os = "linux"))]
-            ApiTransport::Rfcomm { address, channel } => {
-                mb_printer_native::transports::rfcomm::RfcommTransport::bind(
-                    0,
-                    &address,
-                    channel,
+                }
+                #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+                ApiTransport::Rfcomm { .. } => {
+                    Err(("RFCOMM support is unavailable in this build".into(), None))
+                }
+                #[cfg(feature = "usb")]
+                ApiTransport::Usb {
+                    vid,
+                    pid,
+                    interface,
+                    out,
+                    input,
+                } => crate::transport::usb::UsbTransport::open(
+                    vid,
+                    pid,
+                    interface,
+                    out,
+                    input,
                     request.payload_limit,
                 )
-                .map_err(|error| (error, None))
-                .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
-            }
-            #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
-            ApiTransport::Rfcomm { .. } => {
-                Err(("RFCOMM support is unavailable in this build".into(), None))
-            }
-            #[cfg(feature = "usb")]
-            ApiTransport::Usb {
-                vid,
-                pid,
-                interface,
-                out,
-                input,
-            } => crate::transport::usb::UsbTransport::open(
-                vid,
-                pid,
-                interface,
-                out,
-                input,
-                request.payload_limit,
-            )
-            .map_err(|error| (error.to_string(), None))
-            .and_then(|target| execute_cancellable(&plan, target, cancel.clone())),
-            #[cfg(not(feature = "usb"))]
-            ApiTransport::Usb { .. } => {
-                Err(("USB support is unavailable in this build".into(), None))
-            }
-            #[cfg(feature = "bluetooth")]
-            ApiTransport::Ble { address } => worker_runtime
-                .block_on(crate::transport::bluetooth::BleTransport::connect(
-                    &address,
-                    request.payload_limit,
-                ))
                 .map_err(|error| (error.to_string(), None))
                 .and_then(|target| execute_cancellable(&plan, target, cancel.clone())),
-            #[cfg(not(feature = "bluetooth"))]
-            ApiTransport::Ble { .. } => {
-                Err(("BLE support is unavailable in this build".into(), None))
-            }
-        };
-        match execution {
-            Ok(progress) => {
-                running.state = if cancel.load(Ordering::Acquire) {
-                    if progress.potentially_accepted_write {
-                        JobState::CancelledPartial
+                #[cfg(not(feature = "usb"))]
+                ApiTransport::Usb { .. } => {
+                    Err(("USB support is unavailable in this build".into(), None))
+                }
+                #[cfg(feature = "bluetooth")]
+                ApiTransport::Ble { address } => worker_runtime
+                    .block_on(crate::transport::bluetooth::BleTransport::connect(
+                        &address,
+                        request.payload_limit,
+                    ))
+                    .map_err(|error| (error.to_string(), None))
+                    .and_then(|target| execute_cancellable(&plan, target, cancel.clone())),
+                #[cfg(not(feature = "bluetooth"))]
+                ApiTransport::Ble { .. } => {
+                    Err(("BLE support is unavailable in this build".into(), None))
+                }
+            };
+            match execution {
+                Ok(progress) => {
+                    running.state = if cancel.load(Ordering::Acquire) {
+                        if progress.potentially_accepted_write {
+                            JobState::CancelledPartial
+                        } else {
+                            JobState::CancelledBeforeSend
+                        }
                     } else {
-                        JobState::CancelledBeforeSend
-                    }
-                } else {
-                    JobState::Completed
-                };
-                running.last_completed_action = progress.last_completed_action.map(|n| n as u32);
-                running.bytes_written = progress.bytes_written;
-                running.potentially_accepted_write = progress.potentially_accepted_write
-            }
-            Err((error, progress)) => {
-                if let Some(progress) = progress {
+                        JobState::Completed
+                    };
                     running.last_completed_action =
                         progress.last_completed_action.map(|n| n as u32);
                     running.bytes_written = progress.bytes_written;
-                    running.potentially_accepted_write = progress.potentially_accepted_write;
+                    running.potentially_accepted_write = progress.potentially_accepted_write
                 }
-                running.state = if cancel.load(Ordering::Acquire) {
-                    if running.potentially_accepted_write {
-                        JobState::CancelledPartial
-                    } else {
-                        JobState::CancelledBeforeSend
+                Err((error, progress)) => {
+                    if let Some(progress) = progress {
+                        running.last_completed_action =
+                            progress.last_completed_action.map(|n| n as u32);
+                        running.bytes_written = progress.bytes_written;
+                        running.potentially_accepted_write = progress.potentially_accepted_write;
                     }
-                } else if running.potentially_accepted_write {
-                    JobState::OutcomeUnknown
-                } else {
-                    JobState::Failed
-                };
-                running.error = Some(error)
+                    running.state = if cancel.load(Ordering::Acquire) {
+                        if running.potentially_accepted_write {
+                            JobState::CancelledPartial
+                        } else {
+                            JobState::CancelledBeforeSend
+                        }
+                    } else if running.potentially_accepted_write {
+                        JobState::OutcomeUnknown
+                    } else {
+                        JobState::Failed
+                    };
+                    running.error = Some(error)
+                }
             }
-        }
-        running.updated_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let _ = events.send(running.clone());
-        let mut jobs = worker_state.jobs.blocking_write();
-        jobs.insert(id, running);
-        let _ = save_jobs(&worker_state, &jobs);
-    });
-    Ok((StatusCode::ACCEPTED, Json(JobView::from(&accepted))))
+            running.updated_at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let _ = events.send(running.clone());
+            let mut jobs = worker_state.jobs.blocking_write();
+            jobs.insert(id, running);
+            let _ = save_jobs(&worker_state, &jobs);
+        });
+        Ok(SubmitOutcome {
+            status: StatusCode::ACCEPTED,
+            job: accepted,
+        })
+    }
 }
 async fn get_job(
     State(state): State<ApiState>,
@@ -1931,6 +2237,141 @@ mod tests {
             .unwrap()
             .1
     }
+
+    #[tokio::test]
+    async fn persisted_ipp_connection_executes_query_and_print_job() {
+        use http_body_util::BodyExt as _;
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            for expected_operation in [0x000b_u16, 0x0002] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 4096];
+                let header_end = loop {
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                    if let Some(split) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break split + 4;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.parse::<usize>().ok())
+                    })
+                    .unwrap();
+                while request.len() < header_end + content_length {
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert_ne!(count, 0);
+                    request.extend_from_slice(&chunk[..count]);
+                }
+                let body = &request[header_end..header_end + content_length];
+                assert_eq!(u16::from_be_bytes([body[2], body[3]]), expected_operation);
+                if expected_operation == 0x0002 {
+                    assert!(body.windows(3).any(|bytes| bytes == [0x1b, b'i', b'a']));
+                }
+                let response = if expected_operation == 0x000b {
+                    let media = b"om_label_62x29mm";
+                    let mut body = vec![2, 0, 0, 0, 0, 0, 0, 1, 4, 0x44, 0, 11];
+                    body.extend(b"media-ready");
+                    body.extend((media.len() as u16).to_be_bytes());
+                    body.extend(media);
+                    body.push(3);
+                    body
+                } else {
+                    vec![2, 0, 0, 0, 0, 0, 0, 1, 3]
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response.len()
+                )
+                .unwrap();
+                stream.write_all(&response).unwrap();
+            }
+        });
+
+        let state = test_state();
+        let token = test_token(&state).await;
+        state
+            .inject_probe(
+                "secure",
+                ProbeResult {
+                    status: "idle".into(),
+                    media: Some(serde_json::json!({"widthMm":62,"lengthMm":29})),
+                },
+            )
+            .await;
+        let app = router(state.clone());
+        let auth = || format!("Bearer {token}");
+        let configure = Request::post("/v1/connection")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("authorization", auth())
+            .header("content-type", "application/json")
+            .body(Body::from(format!(
+                r#"{{"id":"secure","model":"ql-1110nwb","transport":{{"kind":"ipp","uri":"ipp://127.0.0.1:{}/ipp/print"}}}}"#,
+                address.port()
+            )))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(configure).await.unwrap().status(),
+            StatusCode::OK
+        );
+        let mut body: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/editor-job.json")).unwrap();
+        body.as_object_mut().unwrap().remove("transport");
+        body["printerId"] = serde_json::json!("ql-1110nwb");
+        body["connectionId"] = serde_json::json!("secure");
+        body["dpi"] = serde_json::json!(300);
+        body["document"]["media"]["width"] = serde_json::json!(62);
+        body["document"]["media"]["height"] = serde_json::json!(29);
+        body["document"]["media"]["printableBounds"]["width"] = serde_json::json!(62);
+        body["document"]["media"]["printableBounds"]["height"] = serde_json::json!(29);
+        let submit = Request::post("/v1/jobs")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("authorization", auth())
+            .header("content-type", "application/json")
+            .header("idempotency-key", "ipp-integration")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = app.clone().oneshot(submit).await.unwrap();
+        let response_status = response.status();
+        let submitted: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(response_status, StatusCode::ACCEPTED, "{submitted}");
+        let id = submitted["id"].as_str().unwrap();
+        let mut finished = None;
+        for _ in 0..100 {
+            let get = Request::get(format!("/v1/jobs/{id}"))
+                .header("host", "localhost:9847")
+                .header("origin", "https://editor.example")
+                .header("authorization", auth())
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(get).await.unwrap();
+            let job: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            if job["terminal"] == true {
+                finished = Some(job);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let finished = finished.unwrap();
+        assert_eq!(finished["outcome"], "completed", "{finished}");
+        server.join().unwrap();
+    }
     #[tokio::test]
     async fn idempotency_replays_same_persisted_job_after_restart() {
         use http_body_util::BodyExt as _;
@@ -1962,6 +2403,64 @@ mod tests {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(first["id"], replay["id"]);
+    }
+
+    #[tokio::test]
+    async fn saved_connection_execution_is_serialized() {
+        let state = test_state();
+        let capture = tempfile::NamedTempFile::new().unwrap();
+        state.connections.write().await.insert(
+            "cloud-capture".into(),
+            Connection {
+                id: "cloud-capture".into(),
+                model: "m110".into(),
+                transport: serde_json::json!({"kind":"file","path":capture.path()}),
+                status: "ready".into(),
+                media: None,
+            },
+        );
+        let lock = Arc::new(std::sync::Mutex::new(()));
+        state
+            .connection_executions
+            .write()
+            .await
+            .insert("cloud-capture".into(), lock.clone());
+        let (acquired_sender, acquired_receiver) = std::sync::mpsc::channel();
+        let (release_sender, release_receiver) = std::sync::mpsc::channel();
+        let blocker = std::thread::spawn(move || {
+            let _guard = lock.lock().unwrap();
+            acquired_sender.send(()).unwrap();
+            release_receiver.recv().unwrap();
+        });
+        acquired_receiver.recv().unwrap();
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/editor-job.json")).unwrap();
+        let request = crate::cloud::store::CloudPrintRequest {
+            document: fixture["document"].clone(),
+            model: "m110".into(),
+            dpi: None,
+            rotation: 0,
+            fit: false,
+            density: 6,
+            copies: 1,
+            payload_limit: 512,
+        };
+        let id = Uuid::new_v4();
+        state
+            .submit_cloud_job(id, "cloud-capture", &request, "digest")
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert_eq!(state.cloud_job(id).await.unwrap().state, JobState::Queued);
+        release_sender.send(()).unwrap();
+        blocker.join().unwrap();
+        for _ in 0..500 {
+            if state.cloud_job(id).await.is_some_and(|job| job.terminal()) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("serialized capture did not finish");
     }
     #[tokio::test]
     async fn rejects_non_loopback_host_before_pairing() {

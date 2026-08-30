@@ -5,6 +5,7 @@ pub mod api;
 pub mod assets;
 pub mod auth;
 pub mod cli;
+pub mod cloud;
 pub mod config;
 pub mod device;
 pub mod jobs;
