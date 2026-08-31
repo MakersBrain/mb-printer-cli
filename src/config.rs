@@ -32,7 +32,8 @@ pub struct Config {
     #[serde(default)]
     pub catalogue_path: Option<PathBuf>,
     #[serde(default)]
-    pub connections_path: Option<PathBuf>,
+    #[serde(alias = "connections_path")]
+    pub printers_path: Option<PathBuf>,
     #[serde(default)]
     pub jobs_path: Option<PathBuf>,
     #[serde(default)]
@@ -67,7 +68,7 @@ const fn enabled() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PrinterDefaults {
     pub model: Option<String>,
@@ -151,7 +152,7 @@ impl Default for Config {
             max_document_bytes: default_document_limit(),
             max_recent_jobs: default_jobs(),
             catalogue_path: None,
-            connections_path: None,
+            printers_path: None,
             jobs_path: None,
             cloud: None,
             printer_defaults: PrinterDefaults::default(),

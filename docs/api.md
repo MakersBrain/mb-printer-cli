@@ -3,10 +3,11 @@
 
 The service binds both IPv4 and IPv6 loopback by default and uses port 9847.
 Use `--bind` only to select one explicit loopback address. Run
-`mb-printer api pair`, copy the displayed secret into the editor, and exchange
+`mb-printer service pair`, copy the displayed secret into the editor, and exchange
 it at `POST /v1/pair`. The camelCase response contains `token`, `grantId`, and
 RFC 3339 `expiresAt`. Tokens are hashed at rest, origin-bound, expiring, and
-revocable with `mb-printer api revoke ID`. `mb-printer api rotate ID` replaces
+revocable with `mb-printer service grant revoke ID`.
+`mb-printer service grant rotate ID` replaces
 a grant's bearer token atomically while preserving its bound origin. Browsers
 can inspect, rotate, or revoke only their own grant through `/v1/grants/me` and
 its `/rotate` and `/revoke` subroutes.
@@ -16,7 +17,7 @@ Administrator pairing has its own default-off switch. Before using the browser
 administration flow, set both `enable_brother_wifi_configuration` and
 `enable_brother_wifi_configuration_pairing` to `true`, then restart the
 service. After a local person intentionally runs
-`mb-printer api pair-admin`, the
+`mb-printer service pair-admin`, the
 browser exchanges that one-time secret at `POST /v1/admin/pair`; it cannot use
 `POST /v1/pair` and normal pairing secrets cannot use the administrator route.
 The administrator token is origin-bound, capped at ten minutes, and returned
@@ -94,7 +95,7 @@ the printer host, set the flag and restart the service:
 ```sh
 mb-printer config set enable_brother_wifi_configuration true
 mb-printer config set enable_brother_wifi_configuration_pairing true
-# restart `mb-printer api serve`
+# restart `mb-printer service run`
 ```
 
 Disable either independently with the corresponding `config unset` command.
@@ -120,7 +121,7 @@ normal print grant. The browser sends the complete settings (including its
 password) to `POST /v1/printers/ID/brother/wifi/prepare`. The API validates
 them and retains only a cryptographic fingerprint, returning a non-secret
 review and `approvalId`. A local person must approve that exact request within
-120 seconds with `mb-printer api approve-wifi APPROVAL_ID` (or `--yes` for an
+120 seconds with `mb-printer service wifi approve APPROVAL_ID` (or `--yes` for an
 intentional non-interactive local workflow). The browser then repeats the same settings and `approvalId` at
 `POST /v1/printers/ID/brother/wifi/configure`. The approval is origin-,
 administrator-, printer- and settings-bound, consumed once before the USB

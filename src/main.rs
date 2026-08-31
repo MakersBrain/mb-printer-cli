@@ -5,10 +5,15 @@ use mb_printer_cli::{
     assets,
     auth::{self, AuthStore},
     cli::{
-        ApiCommand, AssetCommand, Cli, CloudCommand, Command, ConfigCommand, DocumentCommand,
-        UsbCommand, WifiCommand,
+        AssetCommand, AssetImportCommand, Cli, CloudCommand, Command, ConfigCommand,
+        DocumentCommand, EndpointCommand, GrantCommand, PrinterCommand, PrinterWifiCommand,
+        ServiceCommand, ServiceWifiCommand, SettingsCommand, TestPattern,
     },
-    config, laposte, printer_ops, raster,
+    config, laposte,
+    output::{self, CommandOutput, OutputFormat, Warning},
+    printer_ops,
+    printers::{Printer, PrinterEndpoint, PrinterStore, PrinterTransport},
+    raster,
     transport::{
         self, CaptureTransport, PhysicalEvent, SerialTransport, TcpTransport, WriteTransport,
     },
@@ -25,33 +30,61 @@ use std::{
 };
 use tracing::Instrument as _;
 
-#[cfg(feature = "network")]
-use mb_printer_cli::cli::NetworkCommand;
-
-#[cfg(feature = "usb")]
-use mb_printer_cli::cli::ReportFormat;
-
 #[tokio::main]
 async fn main() {
-    init_tracing();
-    if let Err(error) = run().await {
-        eprintln!("mb-printer: {error}");
-        std::process::exit(2);
+    let cli = Cli::parse();
+    let json_errors = matches!(cli.log_format, mb_printer_cli::cli::LogFormat::Json);
+    init_tracing(&cli);
+    if let Err(error) = run(cli).await {
+        if json_errors {
+            eprintln!(
+                "{}",
+                json!({"level":"ERROR","target":"mb_printer_cli","message":error.to_string()})
+            );
+        } else {
+            eprintln!("mb-printer: {error}");
+        }
+        std::process::exit(1);
     }
 }
 
-fn init_tracing() {
+fn init_tracing(cli: &Cli) {
+    let default_level = if cli.quiet {
+        "error"
+    } else if let Some(level) = cli.log_level {
+        level.as_str()
+    } else {
+        match cli.verbose {
+            0 => "warn",
+            1 => "debug",
+            _ => "trace",
+        }
+    };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new("mb_printer=info,mb_printer_cli=info")
+        tracing_subscriber::EnvFilter::new(format!(
+            "mb_printer={default_level},mb_printer_cli={default_level}"
+        ))
     });
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .try_init();
+    match cli.log_format {
+        mb_printer_cli::cli::LogFormat::Pretty => {
+            let _ = tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_target(false)
+                .with_writer(std::io::stderr)
+                .try_init();
+        }
+        mb_printer_cli::cli::LogFormat::Json => {
+            let _ = tracing_subscriber::fmt()
+                .json()
+                .with_env_filter(filter)
+                .with_target(true)
+                .with_writer(std::io::stderr)
+                .try_init();
+        }
+    }
 }
 
-async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cli = Cli::parse();
+async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let config_path = cli.config.unwrap_or_else(config::default_path);
     let mut cfg = config::load(&config_path)?;
     let catalogue_path = cfg.catalogue_path.clone().unwrap_or_else(|| {
@@ -61,13 +94,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .join("catalogues.json")
     });
     cfg.catalogue_path = Some(catalogue_path.clone());
-    if cfg.connections_path.is_none() {
-        cfg.connections_path = Some(
-            config_path
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("connections.json"),
-        );
+    if cfg.printers_path.is_none() {
+        let directory = config_path.parent().unwrap_or_else(|| Path::new("."));
+        let printers_path = directory.join("printers.json");
+        let previous_path = directory.join("connections.json");
+        if !printers_path.exists() && previous_path.exists() {
+            let migrated = PrinterStore::load(&previous_path)?;
+            migrated.save(&printers_path)?;
+            tracing::info!(
+                source = %previous_path.display(),
+                destination = %printers_path.display(),
+                printer_count = migrated.printers.len(),
+                "migrated printer store"
+            );
+        }
+        cfg.printers_path = Some(printers_path);
     }
     if cfg.jobs_path.is_none() {
         cfg.jobs_path = Some(
@@ -77,34 +118,32 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .join("jobs.json"),
         );
     }
+    let output_format = cli.format;
     match cli.command {
-        Command::Inspect { input } => {
-            let data = fs::read_to_string(&input)?;
-            let document = load_document(&input)?;
-            let errors = document
-                .validate()
-                .err()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>();
-            println!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &json!({"path":input,"bytes":data.len(),"version":document.version,"name":document.name,"media":document.media,"elements":document.elements.len(),"resources":document.resources.len(),"valid":errors.is_empty(),"errors":errors})
-                )?
-            );
-        }
-        Command::Validate { input } => {
-            validate_document(&input)?;
-            println!("valid label document");
-        }
         Command::Document { command } => match command {
+            DocumentCommand::Inspect { input } => {
+                let data = fs::read_to_string(&input)?;
+                let document = load_document(&input)?;
+                let errors = document
+                    .validate()
+                    .err()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>();
+                let details = json!({"path":input,"bytes":data.len(),"version":document.version,"name":document.name,"media":document.media,"elements":document.elements.len(),"resources":document.resources.len(),"valid":errors.is_empty(),"errors":errors});
+                emit_serialized(output_format, &details)?;
+            }
+            DocumentCommand::Validate { input } => {
+                validate_document(&input)?;
+                let data = json!({"path": input, "valid": true});
+                output::emit(
+                    output_format,
+                    &CommandOutput::new(&data, "Valid label document.", "valid"),
+                )?;
+            }
             DocumentCommand::Fields { input } => {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&load_document(&input)?.fields)?
-                );
+                emit_serialized(output_format, &load_document(&input)?.fields)?;
             }
             DocumentCommand::ImportSvg {
                 input,
@@ -132,107 +171,151 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .join("; ")
                 })?;
                 fs::write(&output, serde_json::to_vec_pretty(&document)?)?;
-                println!("{}", output.display());
+                emit_file(output_format, &output)?;
+            }
+            DocumentCommand::Render(args) => {
+                let document = load_document(&args.input)?;
+                let mut image = raster::render(&document, args.dpi)?;
+                image = raster::preview_transform(
+                    &image,
+                    args.zoom,
+                    args.offset_x_mm * f64::from(args.dpi) / 25.4,
+                    args.offset_y_mm * f64::from(args.dpi) / 25.4,
+                )?;
+                if let (Some(width), Some(height)) = (args.tile_width, args.tile_height) {
+                    for (index, tile) in raster::tiles(&image, width, height)?.iter().enumerate() {
+                        let path = args.output.with_extension(format!("{:04}.png", index + 1));
+                        raster::save_png(tile, args.dpi, &path)?;
+                    }
+                } else if args
+                    .output
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
+                {
+                    let bytes = if let Some(paper) = &args.paper {
+                        raster::sheet_pdf(
+                            &image,
+                            document.media.width,
+                            document.media.height,
+                            args.dpi,
+                            paper,
+                            args.margin_mm,
+                            args.gap_mm,
+                            args.columns,
+                            args.rows,
+                            args.cut_marks,
+                        )?
+                    } else {
+                        raster::pdf(&image, args.dpi)?
+                    };
+                    fs::write(&args.output, bytes)?;
+                } else if args
+                    .output
+                    .extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
+                {
+                    fs::write(
+                        &args.output,
+                        raster::svg_document(&document, &image, args.dpi)?,
+                    )?;
+                } else {
+                    raster::save_png(&image, args.dpi, &args.output)?;
+                }
+                emit_file(output_format, &args.output)?;
+            }
+            DocumentCommand::Laposte {
+                command: mb_printer_cli::cli::LaposteCommand::Print(args),
+            } => {
+                let mut options = args.options;
+                options.result_format = output_format;
+                resolve_saved_printer(&mut options, &cfg)?;
+                apply_config_defaults(&mut options, &cfg)?;
+                laposte::validate_a4(&args.input, &options.page)?;
+                let model = options
+                    .model
+                    .as_deref()
+                    .ok_or("printer model is required for La Poste printing")?;
+                let printer = capabilities::by_id(model)
+                    .ok_or_else(|| format!("unknown printer model {model}"))?;
+                let dpi = options.dpi.unwrap_or(printer.dpi);
+                let stamps =
+                    laposte::extract_pdf(&args.input, args.laposte_format, dpi, &options.page)?;
+                let stamps = select_laposte_slots(stamps, &args.slots)?;
+                if stamps.is_empty() {
+                    return Err("La Poste sheet contains no occupied stamps".into());
+                }
+                for (index, stamp) in stamps.iter().enumerate() {
+                    let plan = plan_stamp(stamp, &printer, &options)?;
+                    let mut stamp_options = options.clone();
+                    if stamps.len() > 1
+                        && let Some(path) = &options.capture
+                    {
+                        stamp_options.capture =
+                            Some(path.with_extension(format!("{}.json", index + 1)));
+                    }
+                    execute_plan(&plan, &stamp_options).await?;
+                }
+                emit_message(
+                    output_format,
+                    "laposte-printed",
+                    format!("Processed {} occupied La Poste stamps.", stamps.len()),
+                )?;
+            }
+            DocumentCommand::Laposte {
+                command: mb_printer_cli::cli::LaposteCommand::Extract(args),
+            } => {
+                laposte::validate_a4(&args.input, &args.page)?;
+                let stamps =
+                    laposte::extract_pdf(&args.input, args.laposte_format, args.dpi, &args.page)?;
+                let stamps = select_laposte_slots(stamps, &args.slots)?;
+                if stamps.is_empty() {
+                    return Err("La Poste selection contains no occupied stamps".into());
+                }
+                fs::write(&args.output, laposte::export_stamps_pdf(&stamps, args.dpi)?)?;
+                let data = json!({"path": args.output, "occupiedStamps": stamps.len()});
+                output::emit(
+                    output_format,
+                    &CommandOutput::new(
+                        &data,
+                        format!(
+                            "Wrote {} ({} occupied stamps)",
+                            args.output.display(),
+                            stamps.len()
+                        ),
+                        format!("{}\t{}", args.output.display(), stamps.len()),
+                    ),
+                )?;
             }
         },
-        Command::Render(args) | Command::Export(args) => {
-            let document = load_document(&args.input)?;
-            let mut image = raster::render(&document, args.dpi)?;
-            image = raster::preview_transform(
-                &image,
-                args.zoom,
-                args.offset_x_mm * f64::from(args.dpi) / 25.4,
-                args.offset_y_mm * f64::from(args.dpi) / 25.4,
+        Command::Model {
+            command: mb_printer_cli::cli::ModelCommand::List,
+        } => {
+            let models = capabilities::bundled();
+            let rows = models
+                .iter()
+                .map(|model| {
+                    vec![
+                        model.id.clone(),
+                        model.name.clone(),
+                        format!("{:?}", model.protocol).to_lowercase(),
+                        model.dpi.to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            output::emit(
+                output_format,
+                &CommandOutput::new(
+                    &models,
+                    output::table(&["ID", "NAME", "PROTOCOL", "DPI"], &rows),
+                    output::text_rows(&rows),
+                ),
             )?;
-            if let (Some(width), Some(height)) = (args.tile_width, args.tile_height) {
-                for (index, tile) in raster::tiles(&image, width, height)?.iter().enumerate() {
-                    let path = args.output.with_extension(format!("{:04}.png", index + 1));
-                    raster::save_png(tile, args.dpi, &path)?;
-                }
-            } else if args
-                .output
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("pdf"))
-            {
-                let bytes = if let Some(paper) = &args.paper {
-                    raster::sheet_pdf(
-                        &image,
-                        document.media.width,
-                        document.media.height,
-                        args.dpi,
-                        paper,
-                        args.margin_mm,
-                        args.gap_mm,
-                        args.columns,
-                        args.rows,
-                        args.cut_marks,
-                    )?
-                } else {
-                    raster::pdf(&image, args.dpi)?
-                };
-                fs::write(&args.output, bytes)?;
-            } else if args
-                .output
-                .extension()
-                .is_some_and(|extension| extension.eq_ignore_ascii_case("svg"))
-            {
-                fs::write(
-                    &args.output,
-                    raster::svg_document(&document, &image, args.dpi)?,
-                )?;
-            } else {
-                raster::save_png(&image, args.dpi, &args.output)?;
-            }
-            println!("{}", args.output.display());
         }
-        Command::Printers => println!(
-            "{}",
-            serde_json::to_string_pretty(&capabilities::bundled())?
-        ),
-        Command::Discover => {
-            #[allow(unused_mut)]
-            let mut devices = transport::discover_native()?;
-            #[cfg(feature = "bluetooth")]
-            devices.extend(transport::bluetooth::discover().await?);
-            println!("{}", serde_json::to_string_pretty(&devices)?);
+        Command::Discover(args) => discover(args, output_format).await?,
+        Command::Printer { command } => {
+            printer_command(command, &cfg, output_format).await?;
         }
-        Command::Network { command } => {
-            #[cfg(feature = "network")]
-            {
-                let args = match command {
-                    NetworkCommand::Discover(args) => {
-                        let options = mb_printer_cli::network::DiscoveryOptions {
-                            timeout_ms: args.timeout_ms,
-                            maximum_services: usize::from(args.max_services),
-                        };
-                        println!(
-                            "{}",
-                            serde_json::to_string_pretty(&mb_printer_cli::network::discover(
-                                options
-                            )?)?
-                        );
-                        None
-                    }
-                    NetworkCommand::Status(args) => Some(args),
-                };
-                if let Some(args) = args {
-                    println!(
-                        "{}",
-                        serde_json::to_string_pretty(&mb_printer_cli::network::status(
-                            mb_printer_cli::network::DiscoveryOptions {
-                                timeout_ms: args.timeout_ms,
-                                maximum_services: usize::from(args.max_services),
-                            }
-                        )?)?
-                    );
-                }
-            }
-            #[cfg(not(feature = "network"))]
-            {
-                let _ = command;
-                return Err("network discovery requires the network Cargo feature".into());
-            }
-        }
+        #[cfg(any())]
         Command::Usb { command } => match command {
             UsbCommand::List { all } => {
                 #[cfg(feature = "usb")]
@@ -289,6 +372,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
+        #[cfg(any())]
         Command::Wifi { command } => match command {
             WifiCommand::Scan { input, selector } => {
                 if let Some(input) = input {
@@ -432,6 +516,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         },
+        #[cfg(any())]
         Command::Status(target) => {
             if let Some(response) = &target.response {
                 println!(
@@ -517,6 +602,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Print(args) => {
             let mut options = args.options;
+            options.result_format = output_format;
+            resolve_saved_printer(&mut options, &cfg)?;
             apply_config_defaults(&mut options, &cfg)?;
             let document = load_print_input(&args.input, &options)?;
             let batch = expand_batch(&document, &options)?;
@@ -533,6 +620,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 execute_plan(&plan, &record_options).await?;
             }
         }
+        #[cfg(any())]
         Command::DensityTest { mut options } => {
             apply_config_defaults(&mut options, &cfg)?;
             let model = options.model.as_deref().ok_or("--model is required")?;
@@ -562,6 +650,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 execute_plan(&plan, &density_options).await?;
             }
         }
+        #[cfg(any())]
         Command::PrintPdf(args) => {
             let mut options = args.options;
             apply_config_defaults(&mut options, &cfg)?;
@@ -592,6 +681,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             eprintln!("processed {} occupied La Poste stamps", stamps.len());
         }
+        #[cfg(any())]
         Command::ExtractPdf(args) => {
             laposte::validate_a4(&args.input, &args.page)?;
             let stamps =
@@ -608,14 +698,21 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
         Command::Config { command } => match command {
-            ConfigCommand::Show => println!("{}", serde_json::to_string_pretty(&cfg)?),
-            ConfigCommand::Path => println!("{}", config_path.display()),
+            ConfigCommand::Show => emit_serialized(output_format, &cfg)?,
+            ConfigCommand::Path => {
+                let display = config_path.display().to_string();
+                let data = json!({"path": config_path});
+                output::emit(
+                    output_format,
+                    &CommandOutput::new(&data, &display, &display),
+                )?;
+            }
             ConfigCommand::Get { key } => {
                 let value = serde_json::to_value(&cfg)?;
                 let nested = key
                     .split('.')
                     .try_fold(&value, |current, part| current.get(part));
-                println!("{}", nested.ok_or("unknown configuration key")?);
+                emit_serialized(output_format, nested.ok_or("unknown configuration key")?)?;
             }
             ConfigCommand::Set { key, value } => {
                 match key.as_str() {
@@ -630,7 +727,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "max_document_bytes" => cfg.max_document_bytes = value.parse()?,
                     "max_recent_jobs" => cfg.max_recent_jobs = value.parse()?,
                     "catalogue_path" => cfg.catalogue_path = Some(value.into()),
-                    "connections_path" => cfg.connections_path = Some(value.into()),
+                    "printers_path" => cfg.printers_path = Some(value.into()),
                     "jobs_path" => cfg.jobs_path = Some(value.into()),
                     key if key.starts_with("printer_defaults.") => {
                         cfg.printer_defaults
@@ -647,6 +744,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     _ => return Err(format!("unknown configuration key {key}").into()),
                 };
                 config::save(&config_path, &cfg)?;
+                emit_message(output_format, "config-set", format!("Set {key}."))?;
             }
             ConfigCommand::Unset { key } => {
                 let defaults = config::Config::default();
@@ -663,7 +761,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "max_document_bytes" => cfg.max_document_bytes = defaults.max_document_bytes,
                     "max_recent_jobs" => cfg.max_recent_jobs = defaults.max_recent_jobs,
                     "catalogue_path" => cfg.catalogue_path = None,
-                    "connections_path" => cfg.connections_path = None,
+                    "printers_path" => cfg.printers_path = None,
                     "jobs_path" => cfg.jobs_path = None,
                     key if key.starts_with("printer_defaults.") => {
                         cfg.printer_defaults
@@ -672,6 +770,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     _ => return Err(format!("unknown configuration key {key}").into()),
                 }
                 config::save(&config_path, &cfg)?;
+                emit_message(output_format, "config-unset", format!("Unset {key}."))?;
             }
             ConfigCommand::Migrate { input } => {
                 let legacy: serde_json::Value = serde_json::from_slice(&fs::read(input)?)?;
@@ -714,44 +813,59 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 cfg.printer_defaults = serde_json::from_value(serde_json::Value::Object(migrated))?;
                 config::save(&config_path, &cfg)?;
-                println!(
-                    "migrated supported security/service settings to {}",
-                    config_path.display()
-                );
+                emit_message(
+                    output_format,
+                    "config-migrated",
+                    format!(
+                        "Migrated supported security/service settings to {}.",
+                        config_path.display()
+                    ),
+                )?;
             }
         },
-        Command::Assets { command } => match command {
-            AssetCommand::List => println!(
-                "{}",
-                serde_json::to_string_pretty(&assets::load_catalogue(&catalogue_path)?)?
-            ),
-            AssetCommand::ImportApk { paths, output } => {
+        Command::Asset { command } => match command {
+            AssetCommand::List => {
+                emit_serialized(output_format, &assets::load_catalogue(&catalogue_path)?)?
+            }
+            AssetCommand::Import {
+                command: AssetImportCommand::Apk { paths, output },
+            } => {
                 let bundle = assets::scan_apks(&paths)?;
                 let output = output.unwrap_or_else(|| "private.mb-assets".into());
                 assets::save_bundle(&output, &bundle)?;
                 assets::register_catalogue(&catalogue_path, &output, &bundle)?;
-                println!("{}", output.display());
+                emit_file(output_format, &output)?;
             }
-            AssetCommand::ImportAndroid { package, output } => {
+            AssetCommand::Import {
+                command: AssetImportCommand::Android { package, output },
+            } => {
                 let bundle = assets::import_android(&package)?;
                 let output = output.unwrap_or_else(|| "private-android.mb-assets".into());
                 assets::save_bundle(&output, &bundle)?;
                 assets::register_catalogue(&catalogue_path, &output, &bundle)?;
-                println!("{}", output.display());
+                emit_file(output_format, &output)?;
             }
         },
-        Command::Api { command } => {
+        Command::Service { command } => {
             let store_path = auth::store_path(&config_path);
             match command {
-                ApiCommand::Pair { expires_seconds } => {
+                ServiceCommand::Pair { expires_seconds } => {
                     let mut store = AuthStore::load(store_path)?;
                     let pair = store.begin_pairing(Duration::from_secs(expires_seconds))?;
-                    println!(
-                        "pairing secret (expires at {}): {}",
-                        pair.expires_at, pair.value
-                    );
+                    let data = json!({"secret": pair.value, "expiresAt": pair.expires_at});
+                    output::emit(
+                        output_format,
+                        &CommandOutput::new(
+                            &data,
+                            format!(
+                                "Pairing secret (expires at {}): {}",
+                                pair.expires_at, pair.value
+                            ),
+                            pair.value,
+                        ),
+                    )?;
                 }
-                ApiCommand::PairAdmin { expires_seconds } => {
+                ServiceCommand::PairAdmin { expires_seconds } => {
                     if !cfg.enable_brother_wifi_configuration_pairing {
                         return Err(
                             "Brother Wi-Fi administrator pairing is disabled; set enable_brother_wifi_configuration_pairing to true locally first"
@@ -760,32 +874,55 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     let mut store = AuthStore::load(store_path)?;
                     let pair = store.begin_admin_pairing(Duration::from_secs(expires_seconds))?;
-                    println!(
-                        "administrator pairing secret (expires at {}): {}",
-                        pair.expires_at, pair.value
-                    );
+                    let data = json!({"secret": pair.value, "expiresAt": pair.expires_at, "administrator": true});
+                    output::emit(
+                        output_format,
+                        &CommandOutput::new(
+                            &data,
+                            format!(
+                                "Administrator pairing secret (expires at {}): {}",
+                                pair.expires_at, pair.value
+                            ),
+                            pair.value,
+                        ),
+                    )?;
                 }
-                ApiCommand::Grants => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&AuthStore::load(store_path)?.grants())?
-                ),
-                ApiCommand::Revoke { id } => {
+                ServiceCommand::Grant {
+                    command: GrantCommand::List,
+                } => emit_serialized(output_format, &AuthStore::load(store_path)?.grants())?,
+                ServiceCommand::Grant {
+                    command: GrantCommand::Revoke { id },
+                } => {
                     let mut store = AuthStore::load(store_path)?;
                     if !store.revoke(id.parse()?)? {
                         return Err("grant not found".into());
                     }
+                    emit_message(output_format, "grant-revoked", "Grant revoked.")?;
                 }
-                ApiCommand::Rotate {
-                    id,
-                    expires_seconds,
+                ServiceCommand::Grant {
+                    command:
+                        GrantCommand::Rotate {
+                            id,
+                            expires_seconds,
+                        },
                 } => {
                     let mut store = AuthStore::load(store_path)?;
                     let token = store
                         .rotate(id.parse()?, Duration::from_secs(expires_seconds))?
                         .ok_or("grant not found")?;
-                    println!("replacement bearer token (shown once): {token}");
+                    let data = json!({"token": token, "shownOnce": true});
+                    output::emit(
+                        output_format,
+                        &CommandOutput::new(
+                            &data,
+                            format!("Replacement bearer token (shown once): {token}"),
+                            token,
+                        ),
+                    )?;
                 }
-                ApiCommand::ApproveWifi { id, yes } => {
+                ServiceCommand::Wifi {
+                    command: ServiceWifiCommand::Approve { id, yes },
+                } => {
                     if !cfg.enable_brother_wifi_configuration {
                         return Err(
                             "Brother Wi-Fi administration is disabled; set enable_brother_wifi_configuration to true locally first"
@@ -818,11 +955,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     if !store.approve_wifi_approval(id)? {
                         return Err("Wi-Fi approval not found, expired, or already consumed".into());
                     }
-                    println!(
-                        "Wi-Fi configuration request approved; return to the browser to apply it."
-                    );
+                    emit_message(
+                        output_format,
+                        "wifi-approved",
+                        "Wi-Fi configuration request approved; return to the browser to apply it.",
+                    )?;
                 }
-                ApiCommand::Serve { bind, port } => {
+                ServiceCommand::Run { bind, port } => {
                     if cfg.allowed_origins.is_empty() {
                         return Err("configure allowed_origins before serving the API".into());
                     }
@@ -858,26 +997,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     printers: Vec::new(),
                 });
                 config::save(&config_path, &cfg)?;
-                println!("enrolled cloud agent {}", enrollment.agent_id);
+                emit_message(
+                    output_format,
+                    "cloud-enrolled",
+                    format!("Enrolled cloud agent {}.", enrollment.agent_id),
+                )?;
             }
-            CloudCommand::Publish { connection, name } => {
+            CloudCommand::Publish { printer, name } => {
                 if name.trim().is_empty() || name.len() > 120 {
                     return Err("cloud printer name must contain 1 to 120 characters".into());
                 }
                 let path = cfg
-                    .connections_path
+                    .printers_path
                     .as_ref()
-                    .ok_or("connections_path is not configured")?;
-                let connections: Vec<serde_json::Value> = serde_json::from_slice(&fs::read(path)?)?;
-                let saved = connections
-                    .iter()
-                    .find(|item| item["id"].as_str() == Some(connection.as_str()))
-                    .ok_or("saved connection not found")?;
-                let model = saved["model"]
-                    .as_str()
-                    .filter(|model| capabilities::by_id(model).is_some())
-                    .ok_or("saved connection has an unknown printer model")?
-                    .to_owned();
+                    .ok_or("printers_path is not configured")?;
+                let printers = PrinterStore::load(path)?;
+                let saved = printers.find(&printer).ok_or("saved printer not found")?;
+                if capabilities::by_id(&saved.model).is_none() {
+                    return Err("saved printer has an unknown model".into());
+                }
+                let connection = saved.id.clone();
+                let model = saved.model.clone();
                 let cloud = cfg.cloud.as_mut().ok_or("cloud agent is not enrolled")?;
                 if cloud
                     .printers
@@ -896,7 +1036,11 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let id = printer.id;
                 cloud.printers.push(printer);
                 config::save(&config_path, &cfg)?;
-                println!("{id}");
+                let data = json!({"printerId": id});
+                output::emit(
+                    output_format,
+                    &CommandOutput::new(&data, format!("Published printer {id}."), id.to_string()),
+                )?;
             }
             CloudCommand::Unpublish { printer_id } => {
                 let cloud = cfg.cloud.as_mut().ok_or("cloud agent is not enrolled")?;
@@ -906,18 +1050,23 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     return Err("published printer not found".into());
                 }
                 config::save(&config_path, &cfg)?;
+                emit_message(
+                    output_format,
+                    "cloud-printer-unpublished",
+                    format!("Unpublished printer {printer_id}."),
+                )?;
             }
             CloudCommand::Status => {
                 let cloud = cfg.cloud.as_ref().ok_or("cloud agent is not enrolled")?;
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&json!({
+                emit_serialized(
+                    output_format,
+                    &json!({
                         "server":cloud.server,
                         "agentId":cloud.agent_id,
                         "tokenConfigured":cloud.token_path.is_file(),
                         "printers":cloud.printers,
-                    }))?
-                );
+                    }),
+                )?;
             }
             CloudCommand::Connect => {
                 let cloud = cfg.cloud.clone().ok_or("cloud agent is not enrolled")?;
@@ -931,6 +1080,803 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
     }
+    Ok(())
+}
+
+fn emit_serialized<T: serde::Serialize>(
+    format: OutputFormat,
+    data: &T,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let pretty = serde_json::to_string_pretty(data)?;
+    let text = serde_json::to_string(data)?;
+    output::emit(format, &CommandOutput::new(data, pretty, text))?;
+    Ok(())
+}
+
+fn emit_message(
+    format: OutputFormat,
+    code: &str,
+    message: impl Into<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let message = message.into();
+    let data = json!({"code": code, "message": message});
+    output::emit(format, &CommandOutput::new(&data, &message, &message))?;
+    Ok(())
+}
+
+fn emit_file(format: OutputFormat, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let display = path.display().to_string();
+    let data = json!({"path": path});
+    output::emit(format, &CommandOutput::new(&data, &display, &display))?;
+    Ok(())
+}
+
+async fn collect_discovery(
+    args: &mb_printer_cli::cli::DiscoverArgs,
+) -> (
+    Vec<mb_printer_cli::discovery::DiscoveryCandidate>,
+    Vec<Warning>,
+) {
+    let report = mb_printer_cli::discovery::discover(mb_printer_cli::discovery::DiscoveryOptions {
+        via: args.via.clone(),
+        timeout: args.timeout,
+        probe: args.probe,
+        include_unknown: args.include_unknown,
+        max_services: args.max_services,
+    })
+    .await;
+    (report.candidates, report.warnings)
+}
+
+async fn discover(
+    args: mb_printer_cli::cli::DiscoverArgs,
+    format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (candidates, warnings) = collect_discovery(&args).await;
+    if args.strict && !warnings.is_empty() {
+        return Err(format!(
+            "strict discovery failed: {}",
+            warnings
+                .iter()
+                .map(|warning| warning.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        )
+        .into());
+    }
+    let rows = candidates
+        .iter()
+        .map(|candidate| {
+            vec![
+                candidate
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "Unknown printer".into()),
+                candidate.model.clone().unwrap_or_else(|| "unknown".into()),
+                candidate.transport.clone(),
+                candidate.endpoint.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    output::emit(
+        format,
+        &CommandOutput::new(
+            &candidates,
+            output::table(&["NAME", "MODEL", "VIA", "ENDPOINT"], &rows),
+            output::text_rows(&rows),
+        )
+        .warnings(warnings),
+    )?;
+    Ok(())
+}
+
+fn printer_store_path(config: &config::Config) -> Result<&Path, Box<dyn std::error::Error>> {
+    config
+        .printers_path
+        .as_deref()
+        .ok_or_else(|| "printer store path is not configured".into())
+}
+
+fn endpoint_selector<'a>(printer: &'a Printer, selector: &str) -> Option<&'a PrinterEndpoint> {
+    printer.endpoints.iter().find(|endpoint| {
+        endpoint.id == selector || endpoint.transport.uri().eq_ignore_ascii_case(selector)
+    })
+}
+
+fn usb_selector(printer: &Printer) -> Result<&str, Box<dyn std::error::Error>> {
+    printer
+        .endpoints
+        .iter()
+        .find_map(|endpoint| match &endpoint.transport {
+            PrinterTransport::Usb {
+                device: Some(device),
+                ..
+            } => Some(device.as_str()),
+            _ => None,
+        })
+        .ok_or_else(|| {
+            format!(
+                "printer {} has no USB administration endpoint",
+                printer.name
+            )
+            .into()
+        })
+}
+
+fn emit_printer(
+    printer: &Printer,
+    format: OutputFormat,
+    action: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let endpoints = printer
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.transport.uri())
+        .collect::<Vec<_>>()
+        .join(", ");
+    output::emit(
+        format,
+        &CommandOutput::new(
+            printer,
+            format!(
+                "{action} printer {}\nModel: {}\nEndpoint: {endpoints}",
+                printer.name, printer.model
+            ),
+            format!("{}\t{}\t{}", printer.name, printer.model, endpoints),
+        ),
+    )?;
+    Ok(())
+}
+
+async fn interactive_printer(name: String) -> Result<Printer, Box<dyn std::error::Error>> {
+    use std::io::{IsTerminal as _, Write as _};
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return Err("non-interactive printer setup requires --model MODEL --endpoint URI".into());
+    }
+    let args = mb_printer_cli::cli::DiscoverArgs {
+        via: Vec::new(),
+        timeout: Duration::from_secs(3),
+        probe: false,
+        include_unknown: false,
+        strict: false,
+        max_services: 64,
+    };
+    let (candidates, warnings) = collect_discovery(&args).await;
+    for warning in warnings {
+        eprintln!("warning [{}]: {}", warning.code, warning.message);
+    }
+    if candidates.is_empty() {
+        return Err(
+            "no printers were discovered; use --model and --endpoint for manual setup".into(),
+        );
+    }
+    eprintln!("Select a printer:");
+    for (index, candidate) in candidates.iter().enumerate() {
+        eprintln!(
+            "  {}) {} [{}] {}",
+            index + 1,
+            candidate.name.as_deref().unwrap_or("Unknown printer"),
+            candidate.model.as_deref().unwrap_or("unknown model"),
+            candidate.endpoint
+        );
+    }
+    eprint!("Printer [1-{}]: ", candidates.len());
+    std::io::stderr().flush()?;
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    let index = answer
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|value| (1..=candidates.len()).contains(value))
+        .ok_or("invalid printer selection")?
+        - 1;
+    let selected = &candidates[index];
+    let model = if let Some(model) = &selected.model {
+        model.clone()
+    } else {
+        eprint!("Printer model ID: ");
+        std::io::stderr().flush()?;
+        let mut model = String::new();
+        std::io::stdin().read_line(&mut model)?;
+        model.trim().to_owned()
+    };
+    if capabilities::by_id(&model).is_none() {
+        return Err(format!("unknown printer model {model}; run `mb-printer model list`").into());
+    }
+    Ok(Printer::new(
+        name,
+        model,
+        vec![PrinterTransport::parse(&selected.endpoint)?],
+    ))
+}
+
+async fn printer_command(
+    command: PrinterCommand,
+    config: &config::Config,
+    format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let path = printer_store_path(config)?;
+    let mut store = PrinterStore::load(path)?;
+    match command {
+        PrinterCommand::List => {
+            let rows = store
+                .printers
+                .iter()
+                .map(|printer| {
+                    vec![
+                        printer.name.clone(),
+                        printer.model.clone(),
+                        printer
+                            .preferred_endpoint()
+                            .map(|endpoint| endpoint.transport.uri())
+                            .unwrap_or_else(|_| "-".into()),
+                        if store.default_printer.as_deref().is_some_and(|default| {
+                            default == printer.id || default.eq_ignore_ascii_case(&printer.name)
+                        }) {
+                            "yes".into()
+                        } else {
+                            "".into()
+                        },
+                    ]
+                })
+                .collect::<Vec<_>>();
+            output::emit(
+                format,
+                &CommandOutput::new(
+                    &store.printers,
+                    output::table(&["NAME", "MODEL", "ENDPOINT", "DEFAULT"], &rows),
+                    output::text_rows(&rows),
+                ),
+            )?;
+        }
+        PrinterCommand::Add {
+            name,
+            model,
+            endpoint,
+            preferred,
+        } => {
+            let printer = if endpoint.is_empty() {
+                interactive_printer(name).await?
+            } else {
+                let model = model.ok_or("--model is required with --endpoint")?;
+                if capabilities::by_id(&model).is_none() {
+                    return Err(format!("unknown printer model {model}").into());
+                }
+                if endpoint.len() > 1 && preferred.is_none() {
+                    return Err("--preferred URI is required with multiple endpoints".into());
+                }
+                let transports = endpoint
+                    .iter()
+                    .map(|endpoint| PrinterTransport::parse(endpoint))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut printer = Printer::new(name, model, transports);
+                if let Some(preferred) = preferred {
+                    let mut matched = false;
+                    for endpoint in &mut printer.endpoints {
+                        endpoint.preferred = endpoint.transport.uri() == preferred;
+                        matched |= endpoint.preferred;
+                    }
+                    if !matched {
+                        return Err("--preferred must match one of the supplied endpoints".into());
+                    }
+                }
+                printer
+            };
+            store.add(printer.clone())?;
+            store.save(path)?;
+            emit_printer(&printer, format, "Added")?;
+        }
+        PrinterCommand::Show { printer } => {
+            let printer = store
+                .find(&printer)
+                .ok_or_else(|| format!("printer {printer} was not found"))?;
+            emit_printer(printer, format, "Saved")?;
+        }
+        PrinterCommand::Rename { printer, new_name } => {
+            mb_printer_cli::printers::validate_name(&new_name)?;
+            if store.find(&new_name).is_some() {
+                return Err(format!("printer {new_name} already exists").into());
+            }
+            let printer = store
+                .find_mut(&printer)
+                .ok_or_else(|| format!("printer {printer} was not found"))?;
+            printer.name = new_name;
+            let printer = printer.clone();
+            store.save(path)?;
+            emit_printer(&printer, format, "Renamed")?;
+        }
+        PrinterCommand::Remove { printer } => {
+            let removed = store.remove(&printer)?;
+            store.save(path)?;
+            emit_printer(&removed, format, "Removed")?;
+        }
+        PrinterCommand::Default { printer, clear } => {
+            if clear {
+                store.default_printer = None;
+            } else if let Some(selector) = printer {
+                store.default_printer = Some(
+                    store
+                        .find(&selector)
+                        .ok_or_else(|| format!("printer {selector} was not found"))?
+                        .id
+                        .clone(),
+                );
+            } else if let Some(default) = &store.default_printer {
+                let printer = store
+                    .find(default)
+                    .ok_or("configured default printer was not found")?;
+                emit_printer(printer, format, "Default")?;
+                return Ok(());
+            } else {
+                output::emit(
+                    format,
+                    &CommandOutput::new(
+                        serde_json::json!({"defaultPrinter": null}),
+                        "No default printer is configured.",
+                        "",
+                    ),
+                )?;
+                return Ok(());
+            }
+            store.save(path)?;
+            let data = serde_json::json!({"defaultPrinter": store.default_printer});
+            output::emit(
+                format,
+                &CommandOutput::new(&data, "Default printer updated.", "updated"),
+            )?;
+        }
+        PrinterCommand::Endpoint { command } => match command {
+            EndpointCommand::List { printer } => {
+                let printer = store
+                    .find(&printer)
+                    .ok_or_else(|| format!("printer {printer} was not found"))?;
+                let rows = printer
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| {
+                        vec![
+                            endpoint.id.clone(),
+                            endpoint.transport.kind().into(),
+                            endpoint.transport.uri(),
+                            if endpoint.preferred { "yes" } else { "" }.into(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                output::emit(
+                    format,
+                    &CommandOutput::new(
+                        &printer.endpoints,
+                        output::table(&["ID", "VIA", "ENDPOINT", "PREFERRED"], &rows),
+                        output::text_rows(&rows),
+                    ),
+                )?;
+            }
+            EndpointCommand::Add {
+                printer,
+                endpoint,
+                preferred,
+            } => {
+                let printer = store
+                    .find_mut(&printer)
+                    .ok_or_else(|| format!("printer {printer} was not found"))?;
+                let transport = PrinterTransport::parse(&endpoint)?;
+                if printer
+                    .endpoints
+                    .iter()
+                    .any(|saved| saved.transport.uri() == transport.uri())
+                {
+                    return Err("endpoint is already configured".into());
+                }
+                if preferred {
+                    for saved in &mut printer.endpoints {
+                        saved.preferred = false;
+                    }
+                }
+                printer.endpoints.push(PrinterEndpoint {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    preferred,
+                    transport,
+                });
+                if printer.endpoints.len() > 1
+                    && !printer.endpoints.iter().any(|endpoint| endpoint.preferred)
+                {
+                    return Err("use --preferred when adding a second endpoint".into());
+                }
+                let printer = printer.clone();
+                store.save(path)?;
+                emit_printer(&printer, format, "Updated")?;
+            }
+            EndpointCommand::Remove { printer, endpoint } => {
+                let printer = store
+                    .find_mut(&printer)
+                    .ok_or_else(|| format!("printer {printer} was not found"))?;
+                let index = printer
+                    .endpoints
+                    .iter()
+                    .position(|saved| saved.id == endpoint || saved.transport.uri() == endpoint)
+                    .ok_or("endpoint was not found")?;
+                if printer.endpoints.len() == 1 {
+                    return Err("a saved printer must retain at least one endpoint".into());
+                }
+                let was_preferred = printer.endpoints.remove(index).preferred;
+                if was_preferred {
+                    printer.endpoints[0].preferred = true;
+                }
+                let printer = printer.clone();
+                store.save(path)?;
+                emit_printer(&printer, format, "Updated")?;
+            }
+            EndpointCommand::Prefer { printer, endpoint } => {
+                let printer = store
+                    .find_mut(&printer)
+                    .ok_or_else(|| format!("printer {printer} was not found"))?;
+                if endpoint_selector(printer, &endpoint).is_none() {
+                    return Err("endpoint was not found".into());
+                }
+                for saved in &mut printer.endpoints {
+                    saved.preferred = saved.id == endpoint || saved.transport.uri() == endpoint;
+                }
+                let printer = printer.clone();
+                store.save(path)?;
+                emit_printer(&printer, format, "Updated")?;
+            }
+        },
+        PrinterCommand::Settings { command } => match command {
+            SettingsCommand::Show { printer } => {
+                let printer = store
+                    .find(&printer)
+                    .ok_or_else(|| format!("printer {printer} was not found"))?;
+                emit_serialized(format, &printer.settings)?;
+            }
+            SettingsCommand::Set {
+                printer,
+                key,
+                value,
+            } => {
+                let printer = store
+                    .find_mut(&printer)
+                    .ok_or_else(|| format!("printer {printer} was not found"))?;
+                printer.settings.set_text(&key, &value)?;
+                let settings = printer.settings.clone();
+                store.save(path)?;
+                emit_serialized(format, &settings)?;
+            }
+            SettingsCommand::Unset { printer, key } => {
+                let printer = store
+                    .find_mut(&printer)
+                    .ok_or_else(|| format!("printer {printer} was not found"))?;
+                printer.settings.unset(&key)?;
+                let settings = printer.settings.clone();
+                store.save(path)?;
+                emit_serialized(format, &settings)?;
+            }
+        },
+        PrinterCommand::Status(target) => {
+            if let Some(response) = target.response {
+                let status = printer_ops::parse_brother_status(&fs::read(response)?)?;
+                emit_serialized(format, &status)?;
+            } else {
+                let printer = store.resolve(target.printer.as_deref())?;
+                let status = printer_status(printer).await?;
+                emit_serialized(format, &status)?;
+            }
+        }
+        PrinterCommand::Test {
+            target,
+            pattern: TestPattern::Density,
+            model,
+            dry_run,
+            capture,
+            transport,
+            payload_limit,
+            baud,
+        } => {
+            let mut options = mb_printer_cli::cli::PrintOptions {
+                model,
+                dry_run,
+                capture,
+                transport,
+                payload_limit,
+                baud,
+                ..Default::default()
+            };
+            options.result_format = format;
+            if target.is_some() {
+                options.printer = target;
+            }
+            resolve_saved_printer(&mut options, config)?;
+            apply_config_defaults(&mut options, config)?;
+            density_test(&options).await?;
+        }
+        PrinterCommand::Report {
+            printer,
+            output,
+            report_format,
+            unsafe_unredacted,
+        } => {
+            let printer = store.resolve(printer.as_deref())?;
+            let selector = usb_selector(printer)?;
+            #[cfg(feature = "usb")]
+            {
+                let report = printer_ops::usb_system_report(Some(selector), !unsafe_unredacted)?;
+                let bytes = match report_format {
+                    mb_printer_cli::cli::ReportFormat::Json => serde_json::to_vec_pretty(&report)?,
+                    mb_printer_cli::cli::ReportFormat::Text => report.text.into_bytes(),
+                };
+                write_owner_only(&output, &bytes)?;
+                output::emit(
+                    format,
+                    &CommandOutput::new(
+                        serde_json::json!({"path": output}),
+                        format!("Wrote {}", output.display()),
+                        output.display().to_string(),
+                    ),
+                )?;
+            }
+            #[cfg(not(feature = "usb"))]
+            {
+                let _ = (selector, output, report_format, unsafe_unredacted);
+                return Err("Brother reports require the usb Cargo feature".into());
+            }
+        }
+        PrinterCommand::Wifi { command } => {
+            printer_wifi(command, &store, format).await?;
+        }
+    }
+    Ok(())
+}
+
+async fn printer_status(
+    printer: &Printer,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let preferred = printer.preferred_endpoint()?;
+    let supports_status = |endpoint: &PrinterEndpoint| {
+        matches!(
+            &endpoint.transport,
+            PrinterTransport::Ipp { .. }
+                | PrinterTransport::Usb { .. }
+                | PrinterTransport::Tcp { .. }
+                | PrinterTransport::File { .. }
+                | PrinterTransport::Serial { .. }
+        )
+    };
+    let endpoint = std::iter::once(preferred)
+        .chain(printer.endpoints.iter())
+        .find(|endpoint| supports_status(endpoint))
+        .unwrap_or(preferred);
+    match &endpoint.transport {
+        PrinterTransport::Ipp {
+            uri,
+            certificate_pem,
+        } => {
+            let endpoint =
+                mb_printer_cli::device::IppEndpoint::new(uri.clone(), certificate_pem.clone())?;
+            let attributes =
+                mb_printer_cli::device::ipp_query_endpoint(&endpoint, Duration::from_secs(5))?;
+            Ok(
+                json!({"printer": printer.name, "endpoint": uri, "reachable": true, "attributes": attributes}),
+            )
+        }
+        PrinterTransport::Usb {
+            device: Some(device),
+            ..
+        } => {
+            let _ = device;
+            #[cfg(feature = "usb")]
+            return Ok(serde_json::to_value(printer_ops::usb_brother_status(
+                Some(device),
+            )?)?);
+            #[cfg(not(feature = "usb"))]
+            return Err("USB status requires the usb Cargo feature".into());
+        }
+        PrinterTransport::Tcp { address, .. } => {
+            TcpTransport::connect(address, 128, Duration::from_secs(5))?;
+            Ok(
+                json!({"printer": printer.name, "endpoint": endpoint.transport.uri(), "reachable": true}),
+            )
+        }
+        PrinterTransport::File { path } => Ok(json!({
+            "printer": printer.name,
+            "endpoint": endpoint.transport.uri(),
+            "reachable": path.parent().is_none_or(Path::exists),
+        })),
+        PrinterTransport::Serial { path, baud } => {
+            let mut target = SerialTransport::open(path, *baud, 128)?;
+            Ok(serde_json::to_value(query_brother_status(&mut target)?)?)
+        }
+        _ => Ok(json!({
+            "printer": printer.name,
+            "endpoint": endpoint.transport.uri(),
+            "reachable": null,
+            "status": "status probing is unavailable for this endpoint",
+        })),
+    }
+}
+
+async fn printer_wifi(
+    command: PrinterWifiCommand,
+    store: &PrinterStore,
+    format: OutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        PrinterWifiCommand::Scan { printer, input } => {
+            let scan = if let Some(input) = input {
+                printer_ops::parse_wireless_scan(&fs::read(input)?)
+            } else {
+                let printer = store.resolve(printer.as_deref())?;
+                let selector = usb_selector(printer)?;
+                let _ = selector;
+                #[cfg(feature = "usb")]
+                {
+                    printer_ops::usb_wireless_scan(Some(selector))?
+                }
+                #[cfg(not(feature = "usb"))]
+                return Err("live wireless scans require the usb Cargo feature".into());
+            };
+            emit_serialized(format, &scan)?;
+        }
+        PrinterWifiCommand::Status { printer, input } => {
+            let status = if let Some(input) = input {
+                printer_ops::parse_wireless_status(&fs::read(input)?)
+            } else {
+                let printer = store.resolve(printer.as_deref())?;
+                let selector = usb_selector(printer)?;
+                let _ = selector;
+                #[cfg(feature = "usb")]
+                {
+                    printer_ops::usb_wireless_status(Some(selector))?
+                }
+                #[cfg(not(feature = "usb"))]
+                return Err("live wireless status requires the usb Cargo feature".into());
+            };
+            emit_serialized(format, &status)?;
+        }
+        PrinterWifiCommand::Encode {
+            ssid,
+            password_stdin,
+        } => {
+            let mut password = String::new();
+            if password_stdin {
+                use std::io::Read as _;
+                std::io::stdin().read_to_string(&mut password)?;
+                while password.ends_with(['\n', '\r']) {
+                    password.pop();
+                }
+            }
+            let obfuscated = password_stdin.then(|| {
+                mb_printer_cli::device::xor_password(password.as_bytes())
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>()
+            });
+            let data = json!({
+                "ssid": ssid,
+                "encodedSsid": mb_printer_cli::device::encode_ssid(&ssid),
+                "obfuscatedPasswordHex": obfuscated,
+                "warning": "reversible device obfuscation; treat as a credential",
+            });
+            emit_serialized(format, &data)?;
+        }
+        PrinterWifiCommand::Decode { input } => {
+            let status = printer_ops::parse_wireless_status(&fs::read(input)?);
+            emit_serialized(format, &status)?;
+        }
+        PrinterWifiCommand::Configure {
+            printer,
+            ssid,
+            password_stdin,
+            encryption,
+            authentication,
+            no_reboot,
+            dry_run,
+            capture,
+        } => {
+            let printer = store.resolve(printer.as_deref())?;
+            let selector = usb_selector(printer)?;
+            let _ = selector;
+            let mut password = String::new();
+            if password_stdin {
+                use std::io::Read as _;
+                std::io::stdin().read_to_string(&mut password)?;
+                while password.ends_with(['\n', '\r']) {
+                    password.pop();
+                }
+            } else if authentication != "open" {
+                return Err(
+                    "use --password-stdin so credentials never appear in process arguments".into(),
+                );
+            }
+            let settings = mb_printer_core::protocol::brother::wifi::WirelessSettings {
+                ssid,
+                password,
+                encryption: encryption.as_str().try_into()?,
+                authentication: authentication.as_str().try_into()?,
+                infrastructure: true,
+                wireless_direct: false,
+                reboot: !no_reboot,
+            };
+            if dry_run {
+                let capture = capture.ok_or("--dry-run requires --capture")?;
+                fs::write(&capture, settings.command()?)?;
+                output::emit(
+                    format,
+                    &CommandOutput::new(
+                        json!({"path": capture}),
+                        format!("Wrote {}", capture.display()),
+                        capture.display().to_string(),
+                    ),
+                )?;
+            } else {
+                #[cfg(feature = "usb")]
+                printer_ops::usb_wireless_configure(selector, &settings)?;
+                #[cfg(not(feature = "usb"))]
+                return Err("Wi-Fi configuration requires the usb Cargo feature".into());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn density_test(
+    options: &mb_printer_cli::cli::PrintOptions,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let model = options
+        .model
+        .as_deref()
+        .ok_or("printer model is required")?;
+    let printer = capabilities::by_id(model).ok_or("unknown printer model")?;
+    let width_bytes = 40u16;
+    let strip = mb_printer_core::protocol::Raster {
+        width_bytes,
+        height: 30,
+        data: vec![0xff; usize::from(width_bytes) * 30],
+    };
+    for density in 1..=8 {
+        let plan = protocol::plan(
+            &printer,
+            &strip,
+            &Options {
+                density,
+                copies: 1,
+                ..Options::default()
+            },
+        )?;
+        let mut density_options = options.clone();
+        density_options.density = density;
+        if let Some(path) = &options.capture {
+            density_options.capture = Some(path.with_extension(format!("density-{density}.json")));
+        }
+        execute_plan(&plan, &density_options).await?;
+    }
+    Ok(())
+}
+
+fn resolve_saved_printer(
+    options: &mut mb_printer_cli::cli::PrintOptions,
+    config: &config::Config,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let configured_transport = options.transport.is_some()
+        || (config.printer_defaults.transport.is_some()
+            && (config.printer_defaults.address.is_some()
+                || config.printer_defaults.device.is_some()));
+    let configured_model = options.model.is_some() || config.printer_defaults.model.is_some();
+    if options.printer.is_none() && (configured_transport || (options.dry_run && configured_model))
+    {
+        return Ok(());
+    }
+    let store = PrinterStore::load(printer_store_path(config)?)?;
+    let printer = store.resolve(options.printer.as_deref())?;
+    if options.model.is_none() {
+        options.model = Some(printer.model.clone());
+    }
+    if options.transport.is_none() {
+        options.transport = Some(printer.preferred_endpoint()?.transport.uri());
+    }
+    let mut printer_config = config.clone();
+    printer_config.printer_defaults = printer.settings.clone();
+    apply_config_defaults(options, &printer_config)?;
+    options.printer = None;
     Ok(())
 }
 
@@ -1499,11 +2445,13 @@ async fn execute_plan_inner(
         if let Some(path) = &options.capture {
             fs::write(path, encoded)?;
         } else {
-            println!("{}", String::from_utf8(encoded)?);
+            let capture: serde_json::Value = serde_json::from_slice(&encoded)?;
+            emit_serialized(options.result_format, &capture)?;
         }
-        eprintln!(
-            "dry-run: {} bytes through action {:?}",
-            progress.bytes_written, progress.last_completed_action
+        tracing::info!(
+            bytes_written = progress.bytes_written,
+            last_completed_action = ?progress.last_completed_action,
+            "dry-run execution completed"
         );
         return Ok(());
     }
@@ -1566,6 +2514,15 @@ async fn execute_plan_inner(
             let _ = address;
             return Err("BLE support requires the bluetooth Cargo feature".into());
         }
+    } else if uri.starts_with("usb-device:") {
+        #[cfg(feature = "usb")]
+        {
+            printer_ops::usb_print(uri, plan)?
+        }
+        #[cfg(not(feature = "usb"))]
+        {
+            return Err("USB support requires the usb Cargo feature".into());
+        }
     } else if let Some(spec) = uri.strip_prefix("usb:") {
         #[cfg(feature = "usb")]
         {
@@ -1604,9 +2561,10 @@ async fn execute_plan_inner(
                 .into(),
         );
     };
-    eprintln!(
-        "completed: {} bytes, last action {:?}",
-        progress.bytes_written, progress.last_completed_action
+    tracing::info!(
+        bytes_written = progress.bytes_written,
+        last_completed_action = ?progress.last_completed_action,
+        "print execution completed"
     );
     Ok(())
 }
@@ -1659,16 +2617,13 @@ fn execute_ipp_plan(
             mb_printer_cli::device::IppValue::Integer(value) => Some(*value),
             mb_printer_cli::device::IppValue::Text(_) => None,
         });
-    eprintln!(
-        "IPP job accepted: {}",
-        job_id.map_or_else(|| "unknown".into(), |id| id.to_string())
-    );
+    tracing::info!(job_id = ?job_id, "IPP job accepted");
     Ok(progress)
 }
 
 #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
 fn parse_rfcomm(spec: &str) -> Result<(&str, u8), Box<dyn std::error::Error>> {
-    let (address, channel) = spec.rsplit_once('@').map_or((spec, "1"), |parts| parts);
+    let (address, channel) = spec.rsplit_once('@').unwrap_or((spec, "1"));
     if address.is_empty()
         || !address
             .bytes()
@@ -1723,9 +2678,13 @@ fn query_brother_status<T: mb_printer_native::Transport>(
 
 #[cfg(test)]
 mod observability_tests {
+    use clap::Parser as _;
+
     #[test]
     fn tracing_initialization_is_idempotent() {
-        super::init_tracing();
-        super::init_tracing();
+        let cli =
+            mb_printer_cli::cli::Cli::try_parse_from(["mb-printer", "model", "list"]).unwrap();
+        super::init_tracing(&cli);
+        super::init_tracing(&cli);
     }
 }

@@ -171,15 +171,66 @@ fn serial_port_is_present(name: &str) -> bool {
     }
 }
 pub fn discover_native() -> io::Result<Vec<NativeDevice>> {
+    discover_native_with_options(true)
+}
+
+/// Discover native endpoints while optionally excluding unclassified USB and
+/// serial devices from the normal user-facing result set.
+pub fn discover_native_with_options(include_unknown: bool) -> io::Result<Vec<NativeDevice>> {
     #[allow(unused_mut)]
-    let mut found = serialport::available_ports()
+    let mut found = discover_serial(include_unknown)?;
+    #[cfg(feature = "usb")]
+    found.extend(usb::discover(include_unknown)?);
+    #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
+    found.extend(discover_rfcomm()?);
+    Ok(found)
+}
+
+pub fn discover_serial(include_unknown: bool) -> io::Result<Vec<NativeDevice>> {
+    Ok(serialport::available_ports()
         .map_err(io::Error::other)?
         .into_iter()
         .filter(|port| serial_port_is_present(&port.port_name))
-        .map(|p| NativeDevice {
-            transport: "serial".into(),
-            address: p.port_name,
-            name: None,
+        .filter_map(|port| {
+            let (name, vendor_id, product_id, serial_number) = match port.port_type {
+                serialport::SerialPortType::UsbPort(info) => (
+                    info.product.or(info.manufacturer),
+                    Some(info.vid),
+                    Some(info.pid),
+                    info.serial_number,
+                ),
+                _ => (None, None, None, None),
+            };
+            let likely_printer = name.as_deref().is_some_and(|name| {
+                let name = name.to_ascii_lowercase();
+                ["printer", "brother", "dymo", "zebra", "munbyn", "label"]
+                    .iter()
+                    .any(|needle| name.contains(needle))
+            });
+            (include_unknown || likely_printer).then_some(NativeDevice {
+                transport: "serial".into(),
+                address: port.port_name,
+                name,
+                vendor_id,
+                product_id,
+                serial_number,
+                ieee1284_device_id: None,
+                #[cfg(feature = "network")]
+                network: None,
+            })
+        })
+        .collect())
+}
+
+#[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
+pub fn discover_rfcomm() -> io::Result<Vec<NativeDevice>> {
+    Ok(mb_printer_native::transports::rfcomm::discover_paired()
+        .map_err(io::Error::other)?
+        .into_iter()
+        .map(|device| NativeDevice {
+            transport: "rfcomm".into(),
+            address: device.address,
+            name: Some(device.name),
             vendor_id: None,
             product_id: None,
             serial_number: None,
@@ -187,27 +238,7 @@ pub fn discover_native() -> io::Result<Vec<NativeDevice>> {
             #[cfg(feature = "network")]
             network: None,
         })
-        .collect::<Vec<_>>();
-    #[cfg(feature = "usb")]
-    found.extend(usb::discover(true)?);
-    #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
-    found.extend(
-        mb_printer_native::transports::rfcomm::discover_paired()
-            .map_err(io::Error::other)?
-            .into_iter()
-            .map(|device| NativeDevice {
-                transport: "rfcomm".into(),
-                address: device.address,
-                name: Some(device.name),
-                vendor_id: None,
-                product_id: None,
-                serial_number: None,
-                ieee1284_device_id: None,
-                #[cfg(feature = "network")]
-                network: None,
-            }),
-    );
-    Ok(found)
+        .collect())
 }
 
 #[cfg(feature = "bluetooth")]

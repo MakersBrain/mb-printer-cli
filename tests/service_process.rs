@@ -73,8 +73,8 @@ fn start(binary: &str, config: &Path, port: u16) -> Child {
         .args([
             "--config",
             config.to_str().unwrap(),
-            "api",
-            "serve",
+            "service",
+            "run",
             "--port",
             &port.to_string(),
         ])
@@ -99,7 +99,7 @@ fn pairing(binary: &str, config: &Path) -> String {
         .args([
             "--config",
             config.to_str().unwrap(),
-            "api",
+            "service",
             "pair",
             "--expires-seconds",
             "120",
@@ -422,7 +422,14 @@ fn external_service_security_restart_and_job_contract() {
     server.wait().unwrap();
     assert!(
         Command::new(binary)
-            .args(["--config", config.to_str().unwrap(), "api", "revoke", grant])
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "service",
+                "grant",
+                "revoke",
+                grant,
+            ])
             .status()
             .unwrap()
             .success()

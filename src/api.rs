@@ -35,6 +35,7 @@ use crate::{
     auth::{AuthStore, loopback_host},
     config::Config,
     jobs::Job,
+    printers::{Printer, PrinterEndpoint, PrinterStore, PrinterTransport},
     raster,
     transport::{SerialTransport, TcpTransport},
 };
@@ -78,13 +79,24 @@ pub struct ApiState {
 impl ApiState {
     pub fn new(auth: AuthStore, config: Config) -> Self {
         let connections = config
-            .connections_path
+            .printers_path
             .as_deref()
-            .and_then(|path| std::fs::read(path).ok())
-            .and_then(|bytes| serde_json::from_slice::<Vec<Connection>>(&bytes).ok())
+            .and_then(|path| PrinterStore::load(path).ok())
             .unwrap_or_default()
+            .printers
             .into_iter()
-            .map(|connection| (connection.id.clone(), connection))
+            .filter_map(|printer| {
+                let transport =
+                    serde_json::to_value(&printer.preferred_endpoint().ok()?.transport).ok()?;
+                let connection = Connection {
+                    id: printer.id.clone(),
+                    model: printer.model,
+                    transport,
+                    status: printer.status.unwrap_or_else(|| "unknown".into()),
+                    media: printer.media,
+                };
+                Some((connection.id.clone(), connection))
+            })
             .collect();
         let jobs = load_jobs(&config);
         Self {
@@ -238,20 +250,54 @@ fn save_connections(
     state: &ApiState,
     connections: &HashMap<String, Connection>,
 ) -> Result<(), ApiError> {
-    let Some(path) = &state.config.connections_path else {
+    let Some(path) = &state.config.printers_path else {
         return Ok(());
     };
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|_| {
-            ApiError(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "connection persistence failed",
-            )
-        })?;
+    let previous = PrinterStore::load(path).unwrap_or_default();
+    let mut printers = connections
+        .values()
+        .filter_map(|connection| {
+            let transport =
+                serde_json::from_value::<PrinterTransport>(connection.transport.clone()).ok()?;
+            let previous_printer = previous.find(&connection.id);
+            let endpoints = previous_printer
+                .map(|printer| printer.endpoints.clone())
+                .unwrap_or_else(|| {
+                    vec![PrinterEndpoint {
+                        id: Uuid::new_v4().to_string(),
+                        preferred: true,
+                        transport,
+                    }]
+                });
+            Some(Printer {
+                id: connection.id.clone(),
+                name: previous_printer
+                    .map(|printer| printer.name.clone())
+                    .unwrap_or_else(|| connection.id.clone()),
+                model: connection.model.clone(),
+                endpoints,
+                settings: previous_printer
+                    .map(|printer| printer.settings.clone())
+                    .unwrap_or_default(),
+                description: previous_printer.and_then(|printer| printer.description.clone()),
+                status: Some(connection.status.clone()),
+                media: connection.media.clone(),
+            })
+        })
+        .collect::<Vec<_>>();
+    printers.sort_by(|left, right| left.name.cmp(&right.name));
+    let default_printer = previous.default_printer.filter(|selector| {
+        printers
+            .iter()
+            .any(|printer| printer.id == *selector || printer.name.eq_ignore_ascii_case(selector))
+    });
+    PrinterStore {
+        schema_version: crate::printers::PRINTER_STORE_SCHEMA,
+        default_printer,
+        printers,
     }
-    let mut values = connections.values().cloned().collect::<Vec<_>>();
-    values.sort_by(|a, b| a.id.cmp(&b.id));
-    std::fs::write(path, serde_json::to_vec_pretty(&values).unwrap()).map_err(|_| {
+    .save(path)
+    .map_err(|_| {
         ApiError(
             StatusCode::INTERNAL_SERVER_ERROR,
             "connection persistence failed",
@@ -452,7 +498,7 @@ async fn pair(
         return Err(ApiError(StatusCode::FORBIDDEN, "origin not allowed"));
     }
     let mut auth = state.auth.write().await;
-    // Pairing secrets are created by a separate `mb-printer api pair`
+    // Pairing secrets are created by a separate `mb-printer service pair`
     // process. Refresh while holding the service lock so the exchange and
     // one-time consumption operate on one durable-store generation.
     auth.reload().map_err(|_| {
@@ -856,26 +902,12 @@ fn probe_transport(transport: &serde_json::Value) -> Result<ProbeResult, ApiErro
 
 async fn discovered_devices(state: &ApiState) -> Vec<crate::transport::NativeDevice> {
     let mut devices = state.injected_devices.read().await.clone();
+    let report = crate::discovery::discover(crate::discovery::DiscoveryOptions::default()).await;
     devices.extend(
-        tokio::task::spawn_blocking(crate::transport::discover_native)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default(),
-    );
-    #[cfg(feature = "bluetooth")]
-    devices.extend(
-        crate::transport::bluetooth::discover()
-            .await
-            .unwrap_or_default(),
-    );
-    #[cfg(all(feature = "network", not(test)))]
-    devices.extend(
-        tokio::task::spawn_blocking(|| crate::network::discover(Default::default()))
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .unwrap_or_default(),
+        report
+            .candidates
+            .into_iter()
+            .map(|candidate| candidate.device),
     );
     devices.sort_by(|left, right| {
         (&left.transport, &left.address).cmp(&(&right.transport, &right.address))
@@ -2184,7 +2216,7 @@ mod tests {
                     "https://labels.dev1.makersbrain.net".into(),
                 ],
                 enable_brother_wifi_configuration: true,
-                connections_path: Some(dir.join("connections.json")),
+                printers_path: Some(dir.join("printers.json")),
                 catalogue_path: Some(dir.join("catalogues.json")),
                 jobs_path: Some(dir.join("jobs.json")),
                 enable_brother_wifi_configuration_pairing: true,
@@ -3136,7 +3168,7 @@ mod tests {
             app.clone().oneshot(request).await.unwrap().status(),
             StatusCode::OK
         );
-        assert!(state.config.connections_path.as_ref().unwrap().exists());
+        assert!(state.config.printers_path.as_ref().unwrap().exists());
         let request = Request::get("/v1/status?connection=desk")
             .header("host", "localhost:9847")
             .header("origin", "https://editor.example")
@@ -3410,7 +3442,7 @@ mod tests {
                 .unwrap();
         let approval_id: Uuid = approval["approvalId"].as_str().unwrap().parse().unwrap();
 
-        // Emulate `mb-printer api approve-wifi`: it must not share the API
+        // Emulate `mb-printer service wifi approve`: it must not share the API
         // process's in-memory AuthStore.
         let mut cli_store = AuthStore::load(directory.path().join("g.json")).unwrap();
         assert!(cli_store.approve_wifi_approval(approval_id).unwrap());

@@ -147,7 +147,7 @@ impl AuthStore {
     }
     /// Refresh this process's in-memory view from the durable store.
     ///
-    /// The local API service and `mb-printer api` commands are separate
+    /// The local API service and `mb-printer service` commands are separate
     /// processes. Commands such as `pair`, `pair-admin`, and `approve-wifi`
     /// update the atomically replaced JSON file, so the service must refresh
     /// while holding its API write lock immediately before it exchanges or

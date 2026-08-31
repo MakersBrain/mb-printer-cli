@@ -8,11 +8,14 @@ pub mod cli;
 pub mod cloud;
 pub mod config;
 pub mod device;
+pub mod discovery;
 pub mod jobs;
 pub mod laposte;
 #[cfg(feature = "network")]
 pub mod network;
+pub mod output;
 pub mod printer_ops;
+pub mod printers;
 pub mod raster;
 pub mod transport;
 
