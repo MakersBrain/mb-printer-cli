@@ -32,9 +32,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - shell: bash
         run: |
-          rustup toolchain install 1.92.0 --profile minimal
-          rustup default 1.92.0
-          test "$(rustc --version | cut -d' ' -f2)" = 1.92.0
+          rustup toolchain install 1.98.0 --profile minimal
+          rustup default 1.98.0
+          test "$(rustc --version | cut -d' ' -f2)" = 1.98.0
       - shell: bash
         run: sh scripts/check_release_version.sh "${{ github.ref_name }}"
       - shell: bash
