@@ -26,7 +26,7 @@ starting the service:
 
 ```sh
 mb-printer config set allowed_origins https://labels.example
-mb-printer api serve
+mb-printer service run
 ```
 
 Brother USB Wi-Fi configuration is disabled by default. If you need it, opt

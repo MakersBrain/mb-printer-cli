@@ -18,7 +18,7 @@ fn render_list_and_dry_run_are_real_commands() {
     fs::write(&input, document()).unwrap();
     let binary = env!("CARGO_BIN_EXE_mb-printer");
     let validate = Command::new(binary)
-        .args(["validate", input.to_str().unwrap()])
+        .args(["document", "validate", input.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
@@ -28,6 +28,7 @@ fn render_list_and_dry_run_are_real_commands() {
     );
     let render = Command::new(binary)
         .args([
+            "document",
             "render",
             input.to_str().unwrap(),
             "-o",
@@ -41,7 +42,10 @@ fn render_list_and_dry_run_are_real_commands() {
         String::from_utf8_lossy(&render.stderr)
     );
     assert!(fs::read(&png).unwrap().starts_with(b"\x89PNG\r\n\x1a\n"));
-    let printers = Command::new(binary).arg("printers").output().unwrap();
+    let printers = Command::new(binary)
+        .args(["model", "list"])
+        .output()
+        .unwrap();
     assert!(printers.status.success());
     assert!(String::from_utf8(printers.stdout).unwrap().contains("m110"));
     let print = Command::new(binary)
@@ -92,13 +96,15 @@ fn document_svg_and_tiled_export_surfaces_execute() {
         ],
         vec!["document", "fields", document.to_str().unwrap()],
         vec![
-            "export",
+            "document",
+            "render",
             document.to_str().unwrap(),
             "-o",
             svg.to_str().unwrap(),
         ],
         vec![
-            "export",
+            "document",
+            "render",
             document.to_str().unwrap(),
             "-o",
             tiles.to_str().unwrap(),
@@ -130,7 +136,7 @@ fn legacy_direct_inputs_rotation_fit_and_sheet_export_execute() {
     )
     .unwrap();
     let validation = Command::new(binary)
-        .args(["validate", legacy.to_str().unwrap()])
+        .args(["document", "validate", legacy.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
@@ -144,7 +150,8 @@ fn legacy_direct_inputs_rotation_fit_and_sheet_export_execute() {
     fs::write(&input, document()).unwrap();
     let export = Command::new(binary)
         .args([
-            "export",
+            "document",
+            "render",
             input.to_str().unwrap(),
             "-o",
             sheet.to_str().unwrap(),
@@ -174,7 +181,8 @@ fn legacy_direct_inputs_rotation_fit_and_sheet_export_execute() {
     let high_dpi_sheet = directory.path().join("sheet-300dpi.pdf");
     let high_dpi_export = Command::new(binary)
         .args([
-            "export",
+            "document",
+            "render",
             input.to_str().unwrap(),
             "-o",
             high_dpi_sheet.to_str().unwrap(),
@@ -326,7 +334,7 @@ fn mocked_brother_and_wifi_status_workflows_decode_without_hardware() {
     reply[17] = 29;
     fs::write(&brother, reply).unwrap();
     let status = Command::new(binary)
-        .args(["status", "--response", brother.to_str().unwrap()])
+        .args(["printer", "status", "--response", brother.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(status.status.success());
@@ -339,7 +347,7 @@ fn mocked_brother_and_wifi_status_workflows_decode_without_hardware() {
     )
     .unwrap();
     let scan = Command::new(binary)
-        .args(["wifi", "scan", "--input", wifi.to_str().unwrap()])
+        .args(["printer", "wifi", "scan", "--input", wifi.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(
@@ -357,7 +365,13 @@ fn mocked_brother_and_wifi_status_workflows_decode_without_hardware() {
     )
     .unwrap();
     let decoded_status = Command::new(binary)
-        .args(["wifi", "status", "--input", wifi_status.to_str().unwrap()])
+        .args([
+            "printer",
+            "wifi",
+            "status",
+            "--input",
+            wifi_status.to_str().unwrap(),
+        ])
         .output()
         .unwrap();
     assert!(decoded_status.status.success());
@@ -370,11 +384,11 @@ fn mocked_brother_and_wifi_status_workflows_decode_without_hardware() {
 }
 
 #[test]
-fn typed_nested_config_and_test_alias_are_exposed() {
+fn typed_nested_config_and_printer_test_are_exposed() {
     let directory = tempfile::tempdir().unwrap();
     let binary = env!("CARGO_BIN_EXE_mb-printer");
     let config = directory.path().join("config.json");
-    for args in [
+    for (index, args) in [
         vec![
             "--config",
             config.to_str().unwrap(),
@@ -390,19 +404,22 @@ fn typed_nested_config_and_test_alias_are_exposed() {
             "get",
             "printer_defaults.density",
         ],
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let output = Command::new(binary).args(args).output().unwrap();
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        if !output.stdout.is_empty() {
+        if index == 1 {
             assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "4");
         }
     }
     let help = Command::new(binary)
-        .args(["test", "--help"])
+        .args(["printer", "test", "--help"])
         .output()
         .unwrap();
     assert!(help.status.success());
@@ -426,7 +443,9 @@ fn empty_laposte_sheet_fails_before_transport_or_capture() {
     .unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_mb-printer"))
         .args([
-            "print-pdf",
+            "document",
+            "laposte",
+            "print",
             input.to_str().unwrap(),
             "--laposte-format",
             "L24A",
@@ -443,4 +462,204 @@ fn empty_laposte_sheet_fails_before_transport_or_capture() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("no occupied stamps"));
     assert!(!capture.exists());
+}
+
+#[test]
+fn managed_printer_happy_path_is_short_and_machine_readable() {
+    let directory = tempfile::tempdir().unwrap();
+    let binary = env!("CARGO_BIN_EXE_mb-printer");
+    let config = directory.path().join("config.json");
+    let transport_output = directory.path().join("printer.bin");
+    let endpoint = format!("file:{}", transport_output.display());
+
+    let added = Command::new(binary)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+            "printer",
+            "add",
+            "desk",
+            "--model",
+            "m110",
+            "--endpoint",
+            &endpoint,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        added.status.success(),
+        "{}",
+        String::from_utf8_lossy(&added.stderr)
+    );
+    let added: serde_json::Value = serde_json::from_slice(&added.stdout).unwrap();
+    assert_eq!(added["schemaVersion"], 1);
+    assert_eq!(added["data"]["name"], "desk");
+    assert_eq!(added["warnings"], serde_json::json!([]));
+
+    let listed = Command::new(binary)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "text",
+            "printer",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).starts_with("desk\tm110\tfile:"));
+
+    let input = directory.path().join("managed-label.json");
+    fs::write(&input, document()).unwrap();
+    let printed = Command::new(binary)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "print",
+            input.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        printed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    assert!(!fs::read(transport_output).unwrap().is_empty());
+
+    let status = Command::new(binary)
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+            "printer",
+            "status",
+        ])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(status["data"]["reachable"], true);
+}
+
+#[test]
+fn old_protocol_oriented_top_level_commands_are_not_exposed() {
+    let binary = env!("CARGO_BIN_EXE_mb-printer");
+    for command in ["usb", "wifi", "network", "printers", "api"] {
+        let output = Command::new(binary).arg(command).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{command} unexpectedly remains exposed"
+        );
+    }
+}
+
+#[test]
+fn json_results_and_json_tracing_never_share_streams() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("trace-label.json");
+    fs::write(&input, document()).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_mb-printer"))
+        .args([
+            "--format",
+            "json",
+            "--log-format",
+            "json",
+            "-v",
+            "print",
+            input.to_str().unwrap(),
+            "--model",
+            "m110",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schemaVersion"], 1);
+    assert_eq!(result["data"]["schema"], 1);
+    let logs = String::from_utf8(output.stderr).unwrap();
+    assert!(!logs.is_empty());
+    for line in logs.lines() {
+        let event: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert!(event.get("level").is_some());
+    }
+}
+
+#[test]
+#[cfg(not(feature = "network"))]
+fn unavailable_discovery_backend_is_a_structured_partial_warning() {
+    let binary = env!("CARGO_BIN_EXE_mb-printer");
+    let output = Command::new(binary)
+        .args([
+            "--format",
+            "json",
+            "discover",
+            "--via",
+            "network",
+            "--timeout",
+            "10ms",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["schemaVersion"], 1);
+    assert_eq!(result["warnings"][0]["code"], "not-compiled");
+
+    let strict = Command::new(binary)
+        .args([
+            "discover",
+            "--via",
+            "network",
+            "--timeout",
+            "10ms",
+            "--strict",
+        ])
+        .output()
+        .unwrap();
+    assert!(!strict.status.success());
+    assert!(String::from_utf8_lossy(&strict.stderr).contains("strict discovery failed"));
+}
+
+#[test]
+fn previous_connection_store_is_migrated_before_printer_commands_run() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.json");
+    let previous = directory.path().join("connections.json");
+    fs::write(
+        &previous,
+        r#"[{"id":"desk","model":"m110","transport":{"kind":"file","path":"/tmp/mb-printer-migrated.bin"},"status":"ready","media":null}]"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_mb-printer"))
+        .args([
+            "--config",
+            config.to_str().unwrap(),
+            "--format",
+            "json",
+            "printer",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["data"][0]["name"], "desk");
+    let migrated: serde_json::Value =
+        serde_json::from_slice(&fs::read(directory.path().join("printers.json")).unwrap()).unwrap();
+    assert_eq!(migrated["schemaVersion"], 1);
+    assert_eq!(migrated["printers"][0]["name"], "desk");
 }

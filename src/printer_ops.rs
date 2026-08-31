@@ -224,6 +224,12 @@ mod usb {
         )
     }
 
+    /// Execute a Brother print plan through a stable discovered USB selector.
+    pub fn print(selector: &str, plan: &Plan) -> Result<Progress, PrinterOpsError> {
+        let resolved = resolve(Some(selector), false)?;
+        execute(&resolved, plan, 64 * 1024)
+    }
+
     pub fn wireless_scan(
         selector: Option<&str>,
     ) -> Result<Vec<wifi::AccessPoint>, PrinterOpsError> {
@@ -303,12 +309,12 @@ mod usb {
 #[cfg(feature = "usb")]
 pub use usb::{devices as brother_usb_devices, selector_for as brother_usb_selector};
 #[cfg(feature = "usb")]
-pub use usb::{status as usb_brother_status, system_report as usb_system_report};
-#[cfg(feature = "usb")]
 pub use usb::{
-    wireless_configure as usb_wireless_configure, wireless_scan as usb_wireless_scan,
-    wireless_status as usb_wireless_status,
+    print as usb_print, wireless_configure as usb_wireless_configure,
+    wireless_scan as usb_wireless_scan, wireless_status as usb_wireless_status,
 };
+#[cfg(feature = "usb")]
+pub use usb::{status as usb_brother_status, system_report as usb_system_report};
 
 #[cfg(test)]
 mod tests {

@@ -1,117 +1,230 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use crate::laposte::LaposteFormat;
+
+pub use crate::discovery::DiscoveryTransport;
 
 #[derive(Debug, Parser)]
 #[command(name = "mb-printer", version, about = "Makers' Brain printer platform")]
 pub struct Cli {
     #[arg(long, global = true, env = "MB_PRINTER_CONFIG")]
     pub config: Option<PathBuf>,
+    /// Command result format. `auto` uses pretty output on a terminal and text in a pipe.
+    #[arg(
+        long,
+        global = true,
+        env = "MB_PRINTER_FORMAT",
+        value_enum,
+        default_value_t = crate::output::OutputFormat::Auto
+    )]
+    pub format: crate::output::OutputFormat,
+    /// Operational tracing level. Logs are always written to stderr.
+    #[arg(long, global = true, value_enum, conflicts_with_all = ["verbose", "quiet"])]
+    pub log_level: Option<LogLevel>,
+    /// Operational tracing serialization.
+    #[arg(
+        long,
+        global = true,
+        env = "MB_PRINTER_LOG_FORMAT",
+        value_enum,
+        default_value_t = LogFormat::Pretty
+    )]
+    pub log_format: LogFormat,
+    /// Increase operational tracing verbosity (`-vv` enables trace output).
+    #[arg(short, long, global = true, action = ArgAction::Count, conflicts_with_all = ["log_level", "quiet"])]
+    pub verbose: u8,
+    /// Only emit errors on stderr.
+    #[arg(short, long, global = true, conflicts_with_all = ["log_level", "verbose"])]
+    pub quiet: bool,
     #[command(subcommand)]
     pub command: Command,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+impl LogLevel {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "error",
+            Self::Warn => "warn",
+            Self::Info => "info",
+            Self::Debug => "debug",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum LogFormat {
+    Pretty,
+    Json,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    Inspect {
-        input: PathBuf,
+    /// Find printers over every available transport.
+    Discover(DiscoverArgs),
+    /// Manage saved physical printers and their settings.
+    Printer {
+        #[command(subcommand)]
+        command: PrinterCommand,
     },
-    Validate {
-        input: PathBuf,
-    },
+    /// Print a document using a saved printer or explicit overrides.
+    Print(PrintArgs),
+    /// Inspect, validate, render, and transform documents.
     Document {
         #[command(subcommand)]
         command: DocumentCommand,
     },
-    Render(RenderArgs),
-    Export(RenderArgs),
-    Printers,
-    Discover,
-    Network {
+    /// List supported printer models.
+    Model {
         #[command(subcommand)]
-        command: NetworkCommand,
+        command: ModelCommand,
     },
-    Usb {
-        #[command(subcommand)]
-        command: UsbCommand,
-    },
-    Wifi {
-        #[command(subcommand)]
-        command: WifiCommand,
-    },
-    Status(PrinterTarget),
-    Print(PrintArgs),
-    #[command(name = "density-test", alias = "test")]
-    DensityTest {
-        #[command(flatten)]
-        options: PrintOptions,
-    },
-    #[command(name = "print-pdf")]
-    PrintPdf(LapostePrintArgs),
-    #[command(name = "extract-pdf")]
-    ExtractPdf(LaposteExtractArgs),
+    /// Manage configuration values.
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
     },
-    Assets {
+    /// Manage private printer assets.
+    Asset {
         #[command(subcommand)]
         command: AssetCommand,
     },
-    Api {
+    /// Run and administer the authenticated loopback service.
+    Service {
         #[command(subcommand)]
-        command: ApiCommand,
+        command: ServiceCommand,
     },
+    /// Connect saved printers to Makers' Brain cloud printing.
     Cloud {
         #[command(subcommand)]
         command: CloudCommand,
     },
 }
 
-#[derive(Debug, Subcommand)]
-pub enum NetworkCommand {
-    /// Discover IPP and IPPS printers advertised over DNS-SD.
-    Discover(NetworkDiscoveryArgs),
-    /// Discover printers and query their live IPP status.
-    Status(NetworkDiscoveryArgs),
-}
-
-#[derive(Debug, Args, Clone, Copy)]
-pub struct NetworkDiscoveryArgs {
-    /// Total DNS-SD browse deadline shared by IPP and IPPS.
-    #[arg(long, default_value_t = 3_000, value_parser = clap::value_parser!(u64).range(1..=10_000))]
-    pub timeout_ms: u64,
-    /// Maximum combined IPP and IPPS services returned.
+#[derive(Debug, Args, Clone)]
+pub struct DiscoverArgs {
+    /// Restrict discovery to a comma-separated set of transports.
+    #[arg(long, value_enum, value_delimiter = ',')]
+    pub via: Vec<DiscoveryTransport>,
+    /// Overall discovery deadline, such as `3s` or `750ms`.
+    #[arg(long, default_value = "3s", value_parser = parse_duration)]
+    pub timeout: std::time::Duration,
+    /// Probe live status after finding candidates.
+    #[arg(long)]
+    pub probe: bool,
+    /// Include USB and serial devices that cannot be classified as printers.
+    #[arg(long)]
+    pub include_unknown: bool,
+    /// Fail if any requested discovery backend fails.
+    #[arg(long)]
+    pub strict: bool,
     #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=256))]
     pub max_services: u16,
 }
 
+fn parse_duration(value: &str) -> Result<std::time::Duration, String> {
+    let (amount, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 1)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1_000)
+    } else {
+        return Err("duration must end in ms or s".into());
+    };
+    let millis = amount
+        .parse::<u64>()
+        .map_err(|_| "duration must contain a positive integer".to_string())?
+        .checked_mul(multiplier)
+        .ok_or_else(|| "duration is too large".to_string())?;
+    if !(1..=10_000).contains(&millis) {
+        return Err("duration must be between 1ms and 10s".into());
+    }
+    Ok(std::time::Duration::from_millis(millis))
+}
+
 #[derive(Debug, Subcommand)]
-pub enum UsbCommand {
+pub enum PrinterCommand {
     List,
-    Info {
-        address: String,
+    Add {
+        name: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        endpoint: Vec<String>,
+        #[arg(long, requires = "endpoint")]
+        preferred: Option<String>,
+    },
+    Show {
+        printer: String,
+    },
+    Rename {
+        printer: String,
+        new_name: String,
+    },
+    Remove {
+        printer: String,
+    },
+    Default {
+        printer: Option<String>,
+        #[arg(long, conflicts_with = "printer")]
+        clear: bool,
+    },
+    Status(PrinterTarget),
+    Test {
+        #[arg(value_name = "PRINTER")]
+        target: Option<String>,
+        #[arg(long, value_enum, default_value_t = TestPattern::Density)]
+        pattern: TestPattern,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        capture: Option<PathBuf>,
+        #[arg(long)]
+        transport: Option<String>,
+        #[arg(long, default_value_t = 512)]
+        payload_limit: usize,
+        #[arg(long, default_value_t = 115_200)]
+        baud: u32,
     },
     Report {
-        #[command(flatten)]
-        selector: UsbSelectorArgs,
+        printer: Option<String>,
         #[arg(short, long)]
         output: PathBuf,
         #[arg(long, value_enum, default_value_t = ReportFormat::Json)]
-        format: ReportFormat,
+        report_format: ReportFormat,
         /// Include network and device identifiers. The output file remains owner-only.
         #[arg(long)]
         unsafe_unredacted: bool,
     },
+    Wifi {
+        #[command(subcommand)]
+        command: PrinterWifiCommand,
+    },
+    Endpoint {
+        #[command(subcommand)]
+        command: EndpointCommand,
+    },
+    Settings {
+        #[command(subcommand)]
+        command: SettingsCommand,
+    },
 }
 
-#[derive(Debug, Args, Clone, Default)]
-pub struct UsbSelectorArgs {
-    /// Stable `usb-device:VID:PID:BUS:ADDRESS` selector or exact USB serial number.
-    #[arg(long)]
-    pub device: Option<String>,
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum TestPattern {
+    Density,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -121,30 +234,30 @@ pub enum ReportFormat {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum WifiCommand {
+pub enum PrinterWifiCommand {
     Scan {
+        printer: Option<String>,
         /// Parse a captured AVAILABLEWLAN reply instead of contacting hardware.
         #[arg(long)]
         input: Option<PathBuf>,
-        #[command(flatten)]
-        selector: UsbSelectorArgs,
     },
     Status {
+        printer: Option<String>,
         /// Parse a captured OBJBRNET reply instead of contacting hardware.
         #[arg(long)]
         input: Option<PathBuf>,
-        #[command(flatten)]
-        selector: UsbSelectorArgs,
     },
+    /// Encode a Brother wireless command value without contacting a printer.
     Encode {
         ssid: String,
         #[arg(long)]
-        password: Option<String>,
+        password_stdin: bool,
     },
-    Decode {
-        input: PathBuf,
-    },
+    /// Decode a captured Brother wireless status response.
+    Decode { input: PathBuf },
     Configure {
+        printer: Option<String>,
+        #[arg(long)]
         ssid: String,
         #[arg(long)]
         password_stdin: bool,
@@ -158,15 +271,20 @@ pub enum WifiCommand {
         dry_run: bool,
         #[arg(short, long)]
         capture: Option<PathBuf>,
-        #[arg(long)]
-        transport: Option<String>,
-        #[arg(long, default_value_t = 115_200)]
-        baud: u32,
     },
 }
 
+// Clap owns these values only during dispatch; boxing nested argument structs would
+// make every command handler less direct without improving the steady-state footprint.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub enum DocumentCommand {
+    Inspect {
+        input: PathBuf,
+    },
+    Validate {
+        input: PathBuf,
+    },
     Fields {
         input: PathBuf,
     },
@@ -181,6 +299,60 @@ pub enum DocumentCommand {
         height_mm: f64,
         #[arg(long, default_value_t = 203)]
         dpi: u16,
+    },
+    Render(RenderArgs),
+    Laposte {
+        #[command(subcommand)]
+        command: LaposteCommand,
+    },
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Subcommand)]
+pub enum LaposteCommand {
+    Print(LapostePrintArgs),
+    Extract(LaposteExtractArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModelCommand {
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EndpointCommand {
+    List {
+        printer: String,
+    },
+    Add {
+        printer: String,
+        endpoint: String,
+        #[arg(long)]
+        preferred: bool,
+    },
+    Remove {
+        printer: String,
+        endpoint: String,
+    },
+    Prefer {
+        printer: String,
+        endpoint: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SettingsCommand {
+    Show {
+        printer: String,
+    },
+    Set {
+        printer: String,
+        key: String,
+        value: String,
+    },
+    Unset {
+        printer: String,
+        key: String,
     },
 }
 
@@ -223,13 +395,11 @@ pub struct RenderArgs {
 
 #[derive(Debug, Args)]
 pub struct PrinterTarget {
-    #[arg(long)]
+    /// Saved printer name or ID. The default or sole printer is used when omitted.
     pub printer: Option<String>,
     /// Decode a captured 32-byte Brother raster status reply.
     #[arg(long)]
     pub response: Option<PathBuf>,
-    #[command(flatten)]
-    pub selector: UsbSelectorArgs,
 }
 
 #[derive(Debug, Args)]
@@ -241,6 +411,8 @@ pub struct PrintArgs {
 
 #[derive(Debug, Args, Clone)]
 pub struct PrintOptions {
+    #[arg(skip)]
+    pub result_format: crate::output::OutputFormat,
     #[arg(long)]
     pub printer: Option<String>,
     #[arg(long)]
@@ -319,6 +491,47 @@ pub struct PrintOptions {
     pub height_mm: Option<f64>,
 }
 
+impl Default for PrintOptions {
+    fn default() -> Self {
+        Self {
+            result_format: crate::output::OutputFormat::Auto,
+            printer: None,
+            model: None,
+            dpi: None,
+            copies: 1,
+            page: Vec::new(),
+            rotation: None,
+            fit: false,
+            dry_run: false,
+            capture: None,
+            transport: None,
+            payload_limit: 512,
+            density: 6,
+            dither: None,
+            feed: None,
+            speed: None,
+            continuous: false,
+            align: None,
+            offset_x: 0,
+            offset_y: 0,
+            gap_mm: None,
+            tspl_offset_mm: None,
+            no_cut: false,
+            cut_every: None,
+            no_compress: false,
+            baud: 115_200,
+            data: Vec::new(),
+            csv: None,
+            mappings: Vec::new(),
+            filter: None,
+            limit: None,
+            copies_from: None,
+            width_mm: None,
+            height_mm: None,
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 pub struct LapostePrintArgs {
     pub input: PathBuf,
@@ -360,15 +573,21 @@ pub enum ConfigCommand {
 #[derive(Debug, Subcommand)]
 pub enum AssetCommand {
     List,
-    #[command(name = "import-android")]
-    ImportAndroid {
+    Import {
+        #[command(subcommand)]
+        command: AssetImportCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AssetImportCommand {
+    Android {
         #[arg(long, default_value = "com.project.aimotech.printmaster")]
         package: String,
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
-    #[command(name = "import-apk")]
-    ImportApk {
+    Apk {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
         #[arg(short, long)]
@@ -377,8 +596,8 @@ pub enum AssetCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum ApiCommand {
-    Serve {
+pub enum ServiceCommand {
+    Run {
         /// Bind one explicit loopback address; by default both IPv4 and IPv6 are served.
         #[arg(long)]
         bind: Option<std::net::IpAddr>,
@@ -396,7 +615,19 @@ pub enum ApiCommand {
         #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=600))]
         expires_seconds: u64,
     },
-    Grants,
+    Grant {
+        #[command(subcommand)]
+        command: GrantCommand,
+    },
+    Wifi {
+        #[command(subcommand)]
+        command: ServiceWifiCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GrantCommand {
+    List,
     Revoke {
         id: String,
     },
@@ -405,8 +636,12 @@ pub enum ApiCommand {
         #[arg(long, default_value_t = 2_592_000)]
         expires_seconds: u64,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceWifiCommand {
     /// Approve one pending browser Wi-Fi configuration request on this machine.
-    ApproveWifi {
+    Approve {
         /// Opaque approval ID returned by the browser prepare request.
         id: String,
         /// Skip the interactive confirmation prompt.
@@ -422,8 +657,7 @@ pub enum CloudCommand {
         server: String,
     },
     Publish {
-        #[arg(long)]
-        connection: String,
+        printer: String,
         #[arg(long)]
         name: String,
     },
@@ -440,10 +674,12 @@ mod tests {
     use clap::Parser;
 
     #[test]
-    fn parses_laposte_compatibility_surface() {
+    fn parses_printer_centric_laposte_surface() {
         let cli = Cli::try_parse_from([
             "mb-printer",
-            "print-pdf",
+            "document",
+            "laposte",
+            "print",
             "sheet.pdf",
             "--laposte-format",
             "SHEET",
@@ -452,7 +688,13 @@ mod tests {
             "--dry-run",
         ])
         .unwrap();
-        let Command::PrintPdf(args) = cli.command else {
+        let Command::Document {
+            command:
+                DocumentCommand::Laposte {
+                    command: LaposteCommand::Print(args),
+                },
+        } = cli.command
+        else {
             panic!()
         };
         assert_eq!(args.laposte_format, LaposteFormat::L24ASheet);
@@ -465,7 +707,9 @@ mod tests {
         assert!(
             Cli::try_parse_from([
                 "mb-printer",
-                "extract-pdf",
+                "document",
+                "laposte",
+                "extract",
                 "x.pdf",
                 "--laposte-format",
                 "L99A"
@@ -475,43 +719,57 @@ mod tests {
     }
 
     #[test]
-    fn network_discovery_arguments_are_bounded() {
+    fn unified_discovery_arguments_are_bounded() {
         let cli = Cli::try_parse_from([
             "mb-printer",
-            "network",
             "discover",
-            "--timeout-ms",
-            "2500",
+            "--via",
+            "usb,network",
+            "--timeout",
+            "2500ms",
             "--max-services",
             "12",
         ])
         .unwrap();
-        let Command::Network {
-            command: NetworkCommand::Discover(args),
+        let Command::Discover(args) = cli.command else {
+            panic!()
+        };
+        assert_eq!(args.timeout, std::time::Duration::from_millis(2500));
+        assert_eq!(
+            args.via,
+            [DiscoveryTransport::Usb, DiscoveryTransport::Network]
+        );
+        assert_eq!(args.max_services, 12);
+        assert!(Cli::try_parse_from(["mb-printer", "discover", "--timeout", "10001ms"]).is_err());
+    }
+
+    #[test]
+    fn managed_printer_commands_have_consistent_action_order() {
+        let cli = Cli::try_parse_from(["mb-printer", "printer", "wifi", "scan", "desk"]).unwrap();
+        let Command::Printer {
+            command:
+                PrinterCommand::Wifi {
+                    command: PrinterWifiCommand::Scan { printer, .. },
+                },
         } = cli.command
         else {
             panic!()
         };
-        assert_eq!(args.timeout_ms, 2500);
-        assert_eq!(args.max_services, 12);
-        assert!(
-            Cli::try_parse_from(["mb-printer", "network", "status", "--timeout-ms", "10001"])
-                .is_err()
-        );
+        assert_eq!(printer.as_deref(), Some("desk"));
     }
 
     #[test]
-    fn administrator_pairing_secret_expiry_is_bounded() {
+    fn service_administrator_pairing_expiry_is_bounded() {
         let cli = Cli::try_parse_from([
             "mb-printer",
-            "api",
+            "service",
             "pair-admin",
             "--expires-seconds",
             "300",
         ])
         .unwrap();
-        let Command::Api {
-            command: ApiCommand::PairAdmin { expires_seconds },
+        let Command::Service {
+            command: ServiceCommand::PairAdmin { expires_seconds },
         } = cli.command
         else {
             panic!()
@@ -520,12 +778,33 @@ mod tests {
         assert!(
             Cli::try_parse_from([
                 "mb-printer",
-                "api",
+                "service",
                 "pair-admin",
                 "--expires-seconds",
                 "601",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn result_and_log_controls_are_global_and_unambiguous() {
+        let cli = Cli::try_parse_from([
+            "mb-printer",
+            "printer",
+            "list",
+            "--format",
+            "json",
+            "--log-format",
+            "json",
+            "-v",
+        ])
+        .unwrap();
+        assert_eq!(cli.format, crate::output::OutputFormat::Json);
+        assert_eq!(cli.verbose, 1);
+        assert!(
+            Cli::try_parse_from(["mb-printer", "--log-level", "info", "-v", "printer", "list"])
+                .is_err()
         );
     }
 }

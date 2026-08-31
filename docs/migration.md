@@ -3,12 +3,14 @@
 
 The binary is `mb-printer`; Python imports and `mbprint` are intentionally not
 retained. The CLI reads legacy v3 JSON through the SDK importer and writes only
-strict portable v4; use `validate` or `inspect` to check the normalized input.
+strict portable v4; use `document validate` or `document inspect` to check the
+normalized input. Existing `connections.json` data is migrated into the typed,
+versioned `printers.json` store on first use.
 
 - Pairing rejected: configure the exact HTTPS editor origin, create a fresh
   secret, and ensure browser Local Network Access is permitted.
 - `401`: the grant expired or was revoked; pair again.
-- Suspected token exposure: run `mb-printer api rotate GRANT_ID`; the old token
+- Suspected token exposure: run `mb-printer service grant rotate GRANT_ID`; the old token
   is invalid as soon as the one-time replacement token is printed.
 - `421`: a non-loopback `Host` was rejected independently of CORS.
 - Serial open failure: check device permissions and `--baud`.

@@ -171,15 +171,66 @@ fn serial_port_is_present(name: &str) -> bool {
     }
 }
 pub fn discover_native() -> io::Result<Vec<NativeDevice>> {
+    discover_native_with_options(true)
+}
+
+/// Discover native endpoints while optionally excluding unclassified USB and
+/// serial devices from the normal user-facing result set.
+pub fn discover_native_with_options(include_unknown: bool) -> io::Result<Vec<NativeDevice>> {
     #[allow(unused_mut)]
-    let mut found = serialport::available_ports()
+    let mut found = discover_serial(include_unknown)?;
+    #[cfg(feature = "usb")]
+    found.extend(usb::discover(include_unknown)?);
+    #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
+    found.extend(discover_rfcomm()?);
+    Ok(found)
+}
+
+pub fn discover_serial(include_unknown: bool) -> io::Result<Vec<NativeDevice>> {
+    Ok(serialport::available_ports()
         .map_err(io::Error::other)?
         .into_iter()
         .filter(|port| serial_port_is_present(&port.port_name))
-        .map(|p| NativeDevice {
-            transport: "serial".into(),
-            address: p.port_name,
-            name: None,
+        .filter_map(|port| {
+            let (name, vendor_id, product_id, serial_number) = match port.port_type {
+                serialport::SerialPortType::UsbPort(info) => (
+                    info.product.or(info.manufacturer),
+                    Some(info.vid),
+                    Some(info.pid),
+                    info.serial_number,
+                ),
+                _ => (None, None, None, None),
+            };
+            let likely_printer = name.as_deref().is_some_and(|name| {
+                let name = name.to_ascii_lowercase();
+                ["printer", "brother", "dymo", "zebra", "munbyn", "label"]
+                    .iter()
+                    .any(|needle| name.contains(needle))
+            });
+            (include_unknown || likely_printer).then_some(NativeDevice {
+                transport: "serial".into(),
+                address: port.port_name,
+                name,
+                vendor_id,
+                product_id,
+                serial_number,
+                ieee1284_device_id: None,
+                #[cfg(feature = "network")]
+                network: None,
+            })
+        })
+        .collect())
+}
+
+#[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
+pub fn discover_rfcomm() -> io::Result<Vec<NativeDevice>> {
+    Ok(mb_printer_native::transports::rfcomm::discover_paired()
+        .map_err(io::Error::other)?
+        .into_iter()
+        .map(|device| NativeDevice {
+            transport: "rfcomm".into(),
+            address: device.address,
+            name: Some(device.name),
             vendor_id: None,
             product_id: None,
             serial_number: None,
@@ -187,27 +238,7 @@ pub fn discover_native() -> io::Result<Vec<NativeDevice>> {
             #[cfg(feature = "network")]
             network: None,
         })
-        .collect::<Vec<_>>();
-    #[cfg(feature = "usb")]
-    found.extend(usb::discover()?);
-    #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
-    found.extend(
-        mb_printer_native::transports::rfcomm::discover_paired()
-            .map_err(io::Error::other)?
-            .into_iter()
-            .map(|device| NativeDevice {
-                transport: "rfcomm".into(),
-                address: device.address,
-                name: Some(device.name),
-                vendor_id: None,
-                product_id: None,
-                serial_number: None,
-                ieee1284_device_id: None,
-                #[cfg(feature = "network")]
-                network: None,
-            }),
-    );
-    Ok(found)
+        .collect())
 }
 
 #[cfg(feature = "bluetooth")]
@@ -519,22 +550,40 @@ pub mod usb {
             }
         }
     }
-    pub fn discover() -> io::Result<Vec<NativeDevice>> {
+    pub fn discover(include_all: bool) -> io::Result<Vec<NativeDevice>> {
         let context = rusb::Context::new().map_err(io::Error::other)?;
         let devices = context.devices().map_err(io::Error::other)?;
         let mut out = Vec::new();
         for device in devices.iter() {
             let descriptor = device.device_descriptor().map_err(io::Error::other)?;
+            let is_printer = descriptor.class_code() == 7
+                || (0..descriptor.num_configurations()).any(|index| {
+                    device.config_descriptor(index).is_ok_and(|configuration| {
+                        configuration
+                            .interfaces()
+                            .flat_map(|interface| interface.descriptors())
+                            .any(|interface| interface.class_code() == 7)
+                    })
+                });
+            if !include_all && !is_printer {
+                continue;
+            }
             let handle = device.open().ok();
-            let name = handle.as_ref().and_then(|handle| {
+            let descriptor_name = handle.as_ref().and_then(|handle| {
                 handle
                     .read_product_string_ascii(&descriptor)
                     .ok()
                     .or_else(|| handle.read_manufacturer_string_ascii(&descriptor).ok())
             });
-            let serial_number = handle
+            let descriptor_serial = handle
                 .as_ref()
                 .and_then(|handle| handle.read_serial_number_string_ascii(&descriptor).ok());
+            #[cfg(target_os = "linux")]
+            let sysfs = linux_sysfs_strings(device.bus_number(), device.address());
+            #[cfg(not(target_os = "linux"))]
+            let sysfs = (None, None);
+            let name = descriptor_name.or(sysfs.0);
+            let serial_number = descriptor_serial.or(sysfs.1);
             let ieee1284_device_id = handle.as_ref().and_then(|handle| {
                 read_ieee1284_device_id(&device, handle, Duration::from_millis(250))
                     .ok()
@@ -559,6 +608,82 @@ pub mod usb {
             });
         }
         Ok(out)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_sysfs_strings(bus: u8, address: u8) -> (Option<String>, Option<String>) {
+        linux_sysfs_strings_at(Path::new("/sys/bus/usb/devices"), bus, address)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_sysfs_strings_at(
+        root: &Path,
+        bus: u8,
+        address: u8,
+    ) -> (Option<String>, Option<String>) {
+        let Some(path) = std::fs::read_dir(root).ok().and_then(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| {
+                    read_sysfs_number(&path.join("busnum")) == Some(u16::from(bus))
+                        && read_sysfs_number(&path.join("devnum")) == Some(u16::from(address))
+                })
+        }) else {
+            return (None, None);
+        };
+        let read_string = |name: &str| {
+            std::fs::read_to_string(path.join(name))
+                .ok()
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        };
+        let product = read_string("product");
+        let manufacturer = read_string("manufacturer");
+        (
+            product
+                .or(manufacturer)
+                .or_else(|| linux_udev_database_name(&path)),
+            read_string("serial"),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_sysfs_number(path: &Path) -> Option<u16> {
+        std::fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn linux_udev_database_name(device: &Path) -> Option<String> {
+        let uevent = std::fs::read_to_string(device.join("uevent")).ok()?;
+        let number = |key: &str| {
+            uevent
+                .lines()
+                .find_map(|line| line.strip_prefix(key))?
+                .parse::<u32>()
+                .ok()
+        };
+        let properties = std::fs::read_to_string(format!(
+            "/run/udev/data/c{}:{}",
+            number("MAJOR=")?,
+            number("MINOR=")?
+        ))
+        .ok()?;
+        udev_database_name(&properties)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn udev_database_name(properties: &str) -> Option<String> {
+        ["E:ID_MODEL_FROM_DATABASE=", "E:ID_VENDOR_FROM_DATABASE="]
+            .into_iter()
+            .find_map(|prefix| {
+                properties
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            })
     }
 
     fn read_ieee1284_device_id(
@@ -614,6 +739,9 @@ pub mod usb {
 
     #[cfg(test)]
     mod tests {
+        #[cfg(target_os = "linux")]
+        use std::fs;
+
         #[test]
         fn parses_bounded_ieee1284_identity() {
             let payload = b"MFG:Brother;MDL:QL-1100;CMD:RASTER;";
@@ -624,6 +752,47 @@ pub mod usb {
                 String::from_utf8(payload.to_vec()).unwrap()
             );
             assert!(super::parse_ieee1284_device_id(&[0, 40, b'M']).is_err());
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn reads_usb_names_without_opening_the_device() {
+            let root = tempfile::tempdir().unwrap();
+            let device = root.path().join("1-4");
+            fs::create_dir(&device).unwrap();
+            fs::write(device.join("busnum"), "1\n").unwrap();
+            fs::write(device.join("devnum"), "60\n").unwrap();
+            fs::write(device.join("manufacturer"), "Brother\n").unwrap();
+            fs::write(device.join("product"), "QL-1110NWB\n").unwrap();
+            fs::write(device.join("serial"), "000A4G930764\n").unwrap();
+
+            assert_eq!(
+                super::linux_sysfs_strings_at(root.path(), 1, 60),
+                (
+                    Some("QL-1110NWB".to_owned()),
+                    Some("000A4G930764".to_owned())
+                )
+            );
+            assert_eq!(
+                super::linux_sysfs_strings_at(root.path(), 1, 61),
+                (None, None)
+            );
+        }
+
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn prefers_udev_model_name_then_vendor_name() {
+            assert_eq!(
+                super::udev_database_name(
+                    "E:ID_VENDOR_FROM_DATABASE=Cambridge Silicon Radio, Ltd\n\
+                     E:ID_MODEL_FROM_DATABASE=Bluetooth Dongle (HCI mode)\n"
+                ),
+                Some("Bluetooth Dongle (HCI mode)".to_owned())
+            );
+            assert_eq!(
+                super::udev_database_name("E:ID_VENDOR_FROM_DATABASE=Acme\n"),
+                Some("Acme".to_owned())
+            );
         }
     }
 }

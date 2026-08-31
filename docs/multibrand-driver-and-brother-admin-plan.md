@@ -377,7 +377,7 @@ usb:04f9:209b:bus=1:address=7
 Completion:
 
 - identical attached printers cannot cause accidental first-match mutation;
-- `mb-printer usb info` exposes identity and port status;
+- `mb-printer discover --via usb --include-unknown` exposes identity details;
 - non-Brother devices are refused by Brother administration operations.
 
 ### Phase 5: Implement read-only Brother administration
@@ -388,7 +388,7 @@ Keep the existing `ESC i S` request and strict 32-byte parser. Expose it using
 the resolved USB device:
 
 ```text
-mb-printer status --device <selector> --json
+mb-printer printer status <printer> --format json
 ```
 
 Return the existing Brother fields: media size/type, status type, phase and
@@ -412,7 +412,7 @@ Validate that every reply names the requested OID. Return field-level errors
 for partial status rather than treating malformed data as disconnected.
 
 ```text
-mb-printer wifi status --device <selector> --json
+mb-printer printer wifi status <printer> --format json
 ```
 
 #### Wireless scan
@@ -427,7 +427,7 @@ Execute the observed Python sequence:
 6. return SSID, channel, power, enterprise and encryption indicators.
 
 ```text
-mb-printer wifi scan --device <selector> --json
+mb-printer printer wifi scan <printer> --format json
 ```
 
 Retain `--input` for offline fixture parsing, clearly labelled as
@@ -449,8 +449,8 @@ The parser should:
 - redact serial, SSID, IP, MAC and other local identifiers by default.
 
 ```text
-mb-printer usb report --device <selector> --format text
-mb-printer usb report --device <selector> --format json --output report.json
+mb-printer printer report <printer> --report-format text --output report.txt
+mb-printer printer report <printer> --report-format json --output report.json
 ```
 
 Unredacted/raw output requires an explicit unsafe option and owner-only output
@@ -491,18 +491,16 @@ Start only after status, scan and report have passed live hardware testing.
     cannot rejoin its prior network.
 
 ```text
-printf '%s' "$WIFI_PASSWORD" | mb-printer wifi configure \
-  --device <selector> \
-  --ssid <ssid> \
-  --security wpa2-personal \
+printf '%s' "$WIFI_PASSWORD" | mb-printer printer wifi configure <printer> --ssid <ssid> \
+  --authentication wpa-psk \
+  --encryption tkip-aes \
   --password-stdin
 
-printf '%s' "$WIFI_PASSWORD" | mb-printer wifi configure \
-  --device <selector> \
-  --ssid <ssid> \
-  --security wpa2-personal \
+printf '%s' "$WIFI_PASSWORD" | mb-printer printer wifi configure <printer> --ssid <ssid> \
+  --authentication wpa-psk \
+  --encryption tkip-aes \
   --password-stdin \
-  --apply --yes
+  --no-reboot
 ```
 
 Completion:
@@ -535,8 +533,8 @@ status implementation rather than introduce another printer abstraction.
 CLI surface:
 
 ```text
-mb-printer network discover --timeout-seconds 3 --json
-mb-printer network status --host <host> --resource /ipp/print --json
+mb-printer discover --via network --timeout 3s --format json
+mb-printer discover --via network --timeout 3s --probe --format json
 ```
 
 Completion:
