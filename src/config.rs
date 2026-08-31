@@ -13,6 +13,16 @@ pub struct Config {
     pub api_port: u16,
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    /// Permit the locally approved Brother USB Wi-Fi mutation API. This is
+    /// deliberately off by default; read-only wireless diagnostics remain
+    /// available for supported USB models.
+    #[serde(default)]
+    pub enable_brother_wifi_configuration: bool,
+    /// Permit issuing and exchanging short-lived administrator pairing secrets
+    /// for Brother Wi-Fi administration. It is intentionally a separate,
+    /// default-off switch from the mutation feature itself.
+    #[serde(default)]
+    pub enable_brother_wifi_configuration_pairing: bool,
     #[serde(default = "default_request_limit")]
     pub max_request_bytes: usize,
     #[serde(default = "default_document_limit")]
@@ -135,6 +145,8 @@ impl Default for Config {
         Self {
             api_port: default_port(),
             allowed_origins: vec![],
+            enable_brother_wifi_configuration: false,
+            enable_brother_wifi_configuration_pairing: false,
             max_request_bytes: default_request_limit(),
             max_document_bytes: default_document_limit(),
             max_recent_jobs: default_jobs(),
@@ -185,6 +197,23 @@ mod tests {
     #[test]
     fn rejects_unknown_config_fields() {
         assert!(serde_json::from_str::<Config>(r#"{"surprise":true}"#).is_err());
+    }
+    #[test]
+    fn brother_wifi_configuration_requires_explicit_opt_in() {
+        assert!(!Config::default().enable_brother_wifi_configuration);
+        assert!(!Config::default().enable_brother_wifi_configuration_pairing);
+        assert!(
+            serde_json::from_str::<Config>(
+                r#"{"enable_brother_wifi_configuration":true,"enable_brother_wifi_configuration_pairing":true}"#,
+            )
+                .unwrap()
+                .enable_brother_wifi_configuration
+        );
+        assert!(serde_json::from_str::<Config>(
+            r#"{"enable_brother_wifi_configuration_pairing":true}"#,
+        )
+        .unwrap()
+        .enable_brother_wifi_configuration_pairing);
     }
     #[test]
     fn printer_defaults_are_typed() {

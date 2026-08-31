@@ -11,9 +11,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - {os: ubuntu-latest, artifact: mb-printer-linux-x86_64-full, binary: mb-printer, features: "usb,bluetooth"}
-          - {os: macos-latest, artifact: mb-printer-macos-aarch64-full, binary: mb-printer, features: "usb,bluetooth"}
-          - {os: windows-latest, artifact: mb-printer-windows-x86_64-full.exe, binary: mb-printer.exe, features: "usb,bluetooth"}
+          - {os: ubuntu-latest, artifact: mb-printer-linux-x86_64-full, binary: mb-printer, features: "brother-admin,bluetooth-linux"}
+          - {os: macos-latest, artifact: mb-printer-macos-aarch64-full, binary: mb-printer, features: "brother-admin,bluetooth"}
+          - {os: windows-latest, artifact: mb-printer-windows-x86_64-full.exe, binary: mb-printer.exe, features: "brother-admin,bluetooth"}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -28,8 +28,6 @@ jobs:
           fetch-depth: 0
       - shell: bash
         run: test "$(git -C _sdk rev-parse HEAD)" = "${{ steps.sdk.outputs.ref }}" && scripts/check_sdk_pin.sh _sdk && cp -R _sdk ../mb-printer-sdk
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - shell: bash
         run: |
           rustup toolchain install 1.98.0 --profile minimal

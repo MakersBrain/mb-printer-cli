@@ -155,6 +155,9 @@ pub struct NativeDevice {
     pub serial_number: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ieee1284_device_id: Option<String>,
+    #[cfg(feature = "network")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub network: Option<crate::network::NetworkDiscoveryDetails>,
 }
 fn serial_port_is_present(name: &str) -> bool {
     #[cfg(unix)]
@@ -181,11 +184,13 @@ pub fn discover_native() -> io::Result<Vec<NativeDevice>> {
             product_id: None,
             serial_number: None,
             ieee1284_device_id: None,
+            #[cfg(feature = "network")]
+            network: None,
         })
         .collect::<Vec<_>>();
     #[cfg(feature = "usb")]
     found.extend(usb::discover()?);
-    #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+    #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
     found.extend(
         mb_printer_native::transports::rfcomm::discover_paired()
             .map_err(io::Error::other)?
@@ -198,6 +203,8 @@ pub fn discover_native() -> io::Result<Vec<NativeDevice>> {
                 product_id: None,
                 serial_number: None,
                 ieee1284_device_id: None,
+                #[cfg(feature = "network")]
+                network: None,
             }),
     );
     Ok(found)
@@ -235,6 +242,8 @@ pub mod bluetooth {
                     product_id: None,
                     serial_number: None,
                     ieee1284_device_id: None,
+                    #[cfg(feature = "network")]
+                    network: None,
                 });
             }
             adapter.stop_scan().await.map_err(io::Error::other)?;
@@ -534,15 +543,19 @@ pub mod usb {
             out.push(NativeDevice {
                 transport: "usb".into(),
                 address: format!(
-                    "usb:{:04x}:{:04x}",
+                    "usb-device:{:04x}:{:04x}:{:03}:{:03}",
                     descriptor.vendor_id(),
-                    descriptor.product_id()
+                    descriptor.product_id(),
+                    device.bus_number(),
+                    device.address()
                 ),
                 name,
                 vendor_id: Some(descriptor.vendor_id()),
                 product_id: Some(descriptor.product_id()),
                 serial_number,
                 ieee1284_device_id,
+                #[cfg(feature = "network")]
+                network: None,
             });
         }
         Ok(out)

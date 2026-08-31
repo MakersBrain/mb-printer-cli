@@ -8,7 +8,7 @@ use mb_printer_cli::{
         ApiCommand, AssetCommand, Cli, CloudCommand, Command, ConfigCommand, DocumentCommand,
         UsbCommand, WifiCommand,
     },
-    config, laposte, raster,
+    config, laposte, printer_ops, raster,
     transport::{
         self, CaptureTransport, PhysicalEvent, SerialTransport, TcpTransport, WriteTransport,
     },
@@ -24,6 +24,12 @@ use std::{
     time::{Duration, Instant},
 };
 use tracing::Instrument as _;
+
+#[cfg(feature = "network")]
+use mb_printer_cli::cli::NetworkCommand;
+
+#[cfg(feature = "usb")]
+use mb_printer_cli::cli::ReportFormat;
 
 #[tokio::main]
 async fn main() {
@@ -190,6 +196,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             devices.extend(transport::bluetooth::discover().await?);
             println!("{}", serde_json::to_string_pretty(&devices)?);
         }
+        Command::Network { command } => {
+            #[cfg(feature = "network")]
+            {
+                let args = match command {
+                    NetworkCommand::Discover(args) => {
+                        let options = mb_printer_cli::network::DiscoveryOptions {
+                            timeout_ms: args.timeout_ms,
+                            maximum_services: usize::from(args.max_services),
+                        };
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&mb_printer_cli::network::discover(
+                                options
+                            )?)?
+                        );
+                        None
+                    }
+                    NetworkCommand::Status(args) => Some(args),
+                };
+                if let Some(args) = args {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&mb_printer_cli::network::status(
+                            mb_printer_cli::network::DiscoveryOptions {
+                                timeout_ms: args.timeout_ms,
+                                maximum_services: usize::from(args.max_services),
+                            }
+                        )?)?
+                    );
+                }
+            }
+            #[cfg(not(feature = "network"))]
+            {
+                let _ = command;
+                return Err("network discovery requires the network Cargo feature".into());
+            }
+        }
         Command::Usb { command } => {
             let devices = transport::discover_native()?
                 .into_iter()
@@ -206,53 +249,77 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                             .ok_or("USB device not found")?
                     )?
                 ),
-                UsbCommand::Report { output } => {
-                    let report = json!({"schema":1,"capturedAt":chrono::Utc::now().to_rfc3339(),"hardwareClaim":false,"devices":devices});
-                    fs::write(&output, serde_json::to_vec_pretty(&report)?)?;
-                    println!("{}", output.display());
+                UsbCommand::Report {
+                    selector,
+                    output,
+                    format,
+                    unsafe_unredacted,
+                } => {
+                    #[cfg(feature = "usb")]
+                    {
+                        let report = printer_ops::usb_system_report(
+                            selector.device.as_deref(),
+                            !unsafe_unredacted,
+                        )?;
+                        let bytes = match format {
+                            ReportFormat::Json => serde_json::to_vec_pretty(&report)?,
+                            ReportFormat::Text => report.text.into_bytes(),
+                        };
+                        write_owner_only(&output, &bytes)?;
+                        println!("{}", output.display());
+                    }
+                    #[cfg(not(feature = "usb"))]
+                    {
+                        let _ = (selector, output, format, unsafe_unredacted);
+                        return Err("Brother reports require the usb Cargo feature".into());
+                    }
                 }
             }
         }
         Command::Wifi { command } => match command {
-            WifiCommand::Scan { input } => {
+            WifiCommand::Scan { input, selector } => {
                 if let Some(input) = input {
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&mb_printer_cli::device::wifi_access_points(
+                        serde_json::to_string_pretty(&printer_ops::parse_wireless_scan(
                             &fs::read(input)?
-                        )?)?
+                        ))?
                     );
                 } else {
-                    use base64::Engine as _;
+                    #[cfg(feature = "usb")]
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(&json!({
-                            "hardwareClaim": false,
-                            "commandsBase64": [
-                                base64::engine::general_purpose::STANDARD.encode(mb_printer_cli::device::wifi_scan_start()),
-                                base64::engine::general_purpose::STANDARD.encode(mb_printer_cli::device::wifi_scan_results())
-                            ]
-                        }))?
+                        serde_json::to_string_pretty(&printer_ops::usb_wireless_scan(
+                            selector.device.as_deref()
+                        )?)?
                     );
+                    #[cfg(not(feature = "usb"))]
+                    {
+                        let _ = selector;
+                        return Err("live wireless scans require the usb Cargo feature".into());
+                    }
                 }
             }
-            WifiCommand::Status { input } => {
+            WifiCommand::Status { input, selector } => {
                 if let Some(input) = input {
                     let data = fs::read(input)?;
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(
-                            &json!({"connected":mb_printer_cli::device::wifi_status(&data),"ipAddress":mb_printer_cli::device::wifi_ip(&data)})
-                        )?
+                        serde_json::to_string_pretty(&printer_ops::parse_wireless_status(&data))?
                     );
                 } else {
-                    use base64::Engine as _;
+                    #[cfg(feature = "usb")]
                     println!(
                         "{}",
-                        serde_json::to_string_pretty(
-                            &json!({"hardwareClaim":false,"commandsBase64":[base64::engine::general_purpose::STANDARD.encode(mb_printer_cli::device::wifi_inquire("458867")?),base64::engine::general_purpose::STANDARD.encode(mb_printer_cli::device::wifi_inquire("458967.2")?)]})
-                        )?
+                        serde_json::to_string_pretty(&printer_ops::usb_wireless_status(
+                            selector.device.as_deref()
+                        )?)?
                     );
+                    #[cfg(not(feature = "usb"))]
+                    {
+                        let _ = selector;
+                        return Err("live wireless status requires the usb Cargo feature".into());
+                    }
                 }
             }
             WifiCommand::Encode { ssid, password } => {
@@ -273,9 +340,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let data = fs::read(input)?;
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(
-                        &json!({"connected":mb_printer_cli::device::wifi_status(&data),"ipAddress":mb_printer_cli::device::wifi_ip(&data)})
-                    )?
+                    serde_json::to_string_pretty(&printer_ops::parse_wireless_status(&data))?
                 );
             }
             WifiCommand::Configure {
@@ -327,7 +392,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         SerialTransport::open(Path::new(path), baud, command.len())?
                             .write(&command)?;
                     } else if let Some(spec) = uri.strip_prefix("rfcomm:") {
-                        #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+                        #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
                         {
                             let (address, channel) = parse_rfcomm(spec)?;
                             let mut target =
@@ -339,10 +404,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 )?;
                             target.write(&command)?;
                         }
-                        #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+                        #[cfg(not(all(feature = "bluetooth-linux", target_os = "linux")))]
                         {
                             let _ = spec;
-                            return Err("RFCOMM requires the bluetooth feature on Linux".into());
+                            return Err(
+                                "RFCOMM requires the bluetooth-linux feature on Linux".into()
+                            );
                         }
                     } else {
                         return Err(
@@ -356,10 +423,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(response) = &target.response {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&mb_printer_cli::device::brother_status(
-                        &fs::read(response)?
+                    serde_json::to_string_pretty(&printer_ops::parse_brother_status(&fs::read(
+                        response
+                    )?)?)?
+                );
+            } else if target.selector.device.is_some() {
+                #[cfg(feature = "usb")]
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&printer_ops::usb_brother_status(
+                        target.selector.device.as_deref()
                     )?)?
                 );
+                #[cfg(not(feature = "usb"))]
+                return Err("live USB status requires the usb Cargo feature".into());
             } else if let Some(address) = target
                 .printer
                 .as_deref()
@@ -402,7 +479,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .and_then(|value| value.strip_prefix("rfcomm:"))
             {
                 let _ = spec;
-                #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+                #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
                 {
                     let (address, channel) = parse_rfcomm(spec)?;
                     let mut transport =
@@ -414,8 +491,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         serde_json::to_string_pretty(&query_brother_status(&mut transport)?)?
                     );
                 }
-                #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
-                return Err("RFCOMM requires the bluetooth feature on Linux".into());
+                #[cfg(not(all(feature = "bluetooth-linux", target_os = "linux")))]
+                return Err("RFCOMM requires the bluetooth-linux feature on Linux".into());
             } else {
                 println!(
                     "{}",
@@ -530,6 +607,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             ConfigCommand::Set { key, value } => {
                 match key.as_str() {
                     "api_port" => cfg.api_port = value.parse()?,
+                    "enable_brother_wifi_configuration" => {
+                        cfg.enable_brother_wifi_configuration = value.parse()?
+                    }
+                    "enable_brother_wifi_configuration_pairing" => {
+                        cfg.enable_brother_wifi_configuration_pairing = value.parse()?
+                    }
                     "max_request_bytes" => cfg.max_request_bytes = value.parse()?,
                     "max_document_bytes" => cfg.max_document_bytes = value.parse()?,
                     "max_recent_jobs" => cfg.max_recent_jobs = value.parse()?,
@@ -556,6 +639,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let defaults = config::Config::default();
                 match key.as_str() {
                     "api_port" => cfg.api_port = defaults.api_port,
+                    "enable_brother_wifi_configuration" => {
+                        cfg.enable_brother_wifi_configuration = false
+                    }
+                    "enable_brother_wifi_configuration_pairing" => {
+                        cfg.enable_brother_wifi_configuration_pairing = false
+                    }
                     "allowed_origins" => cfg.allowed_origins.clear(),
                     "max_request_bytes" => cfg.max_request_bytes = defaults.max_request_bytes,
                     "max_document_bytes" => cfg.max_document_bytes = defaults.max_document_bytes,
@@ -649,6 +738,20 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         pair.expires_at, pair.value
                     );
                 }
+                ApiCommand::PairAdmin { expires_seconds } => {
+                    if !cfg.enable_brother_wifi_configuration_pairing {
+                        return Err(
+                            "Brother Wi-Fi administrator pairing is disabled; set enable_brother_wifi_configuration_pairing to true locally first"
+                                .into(),
+                        );
+                    }
+                    let mut store = AuthStore::load(store_path)?;
+                    let pair = store.begin_admin_pairing(Duration::from_secs(expires_seconds))?;
+                    println!(
+                        "administrator pairing secret (expires at {}): {}",
+                        pair.expires_at, pair.value
+                    );
+                }
                 ApiCommand::Grants => println!(
                     "{}",
                     serde_json::to_string_pretty(&AuthStore::load(store_path)?.grants())?
@@ -668,6 +771,43 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .rotate(id.parse()?, Duration::from_secs(expires_seconds))?
                         .ok_or("grant not found")?;
                     println!("replacement bearer token (shown once): {token}");
+                }
+                ApiCommand::ApproveWifi { id, yes } => {
+                    if !cfg.enable_brother_wifi_configuration {
+                        return Err(
+                            "Brother Wi-Fi administration is disabled; set enable_brother_wifi_configuration to true locally first"
+                                .into(),
+                        );
+                    }
+                    let id = id.parse()?;
+                    let mut store = AuthStore::load(store_path)?;
+                    let approval = store
+                        .wifi_approval(id)
+                        .ok_or("Wi-Fi approval not found or already expired")?;
+                    if !yes {
+                        use std::io::{IsTerminal as _, Write as _};
+                        if !std::io::stdin().is_terminal() {
+                            return Err(
+                                "use --yes when approving from a non-interactive terminal".into()
+                            );
+                        }
+                        eprintln!(
+                            "Approve pending Wi-Fi configuration request {} (expires at {})? [y/N]",
+                            approval.id, approval.expires_at
+                        );
+                        std::io::stderr().flush()?;
+                        let mut answer = String::new();
+                        std::io::stdin().read_line(&mut answer)?;
+                        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                            return Err("Wi-Fi approval was not confirmed".into());
+                        }
+                    }
+                    if !store.approve_wifi_approval(id)? {
+                        return Err("Wi-Fi approval not found, expired, or already consumed".into());
+                    }
+                    println!(
+                        "Wi-Fi configuration request approved; return to the browser to apply it."
+                    );
                 }
                 ApiCommand::Serve { bind, port } => {
                     if cfg.allowed_origins.is_empty() {
@@ -1385,7 +1525,7 @@ async fn execute_plan_inner(
             SerialTransport::open(Path::new(path), options.baud, options.payload_limit)?;
         mb_printer_native::execute(plan, &mut target)?
     } else if let Some(spec) = uri.strip_prefix("rfcomm:") {
-        #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+        #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
         {
             let (address, channel) = parse_rfcomm(spec)?;
             let mut target = mb_printer_native::transports::rfcomm::RfcommTransport::bind(
@@ -1396,10 +1536,10 @@ async fn execute_plan_inner(
             )?;
             mb_printer_native::execute(plan, &mut target)?
         }
-        #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+        #[cfg(not(all(feature = "bluetooth-linux", target_os = "linux")))]
         {
             let _ = spec;
-            return Err("RFCOMM requires the bluetooth feature on Linux".into());
+            return Err("RFCOMM requires the bluetooth-linux feature on Linux".into());
         }
     } else if let Some(address) = uri.strip_prefix("ble:") {
         #[cfg(feature = "bluetooth")]
@@ -1513,7 +1653,7 @@ fn execute_ipp_plan(
     Ok(progress)
 }
 
-#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+#[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
 fn parse_rfcomm(spec: &str) -> Result<(&str, u8), Box<dyn std::error::Error>> {
     let (address, channel) = spec.rsplit_once('@').map_or((spec, "1"), |parts| parts);
     if address.is_empty()
@@ -1530,13 +1670,36 @@ fn parse_rfcomm(spec: &str) -> Result<(&str, u8), Box<dyn std::error::Error>> {
     Ok((address, channel))
 }
 
+#[cfg(feature = "usb")]
+fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        options.mode(0o600);
+        let mut file = options.open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = options.open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    }
+}
+
 fn query_brother_status<T: mb_printer_native::Transport>(
     transport: &mut T,
-) -> Result<mb_printer_cli::device::BrotherStatus, Box<dyn std::error::Error>> {
+) -> Result<mb_printer_core::protocol::brother::status::BrotherStatus, Box<dyn std::error::Error>> {
     transport.write(b"\x1biS")?;
     match transport.wait_response(3_000)? {
         mb_printer_native::WaitOutcome::Response(bytes) => {
-            Ok(mb_printer_cli::device::brother_status(&bytes)?)
+            Ok(printer_ops::parse_brother_status(&bytes)?)
         }
         mb_printer_native::WaitOutcome::Timeout => Err("Brother status timed out".into()),
         mb_printer_native::WaitOutcome::Unavailable => {

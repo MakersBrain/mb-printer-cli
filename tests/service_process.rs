@@ -167,6 +167,17 @@ fn hosted_editor_preflight_and_grant_are_exact_in_real_service() {
 
     let pair = exchange_at_origin(port, &secret, origin);
     let auth = format!("Bearer {}", pair["token"].as_str().unwrap());
+    let (status, headers, _) = request(
+        port,
+        "GET",
+        "/v1/status",
+        &[("Origin", origin), ("Authorization", &auth)],
+        "",
+    );
+    assert_eq!(status, 200);
+    let headers = headers.to_ascii_lowercase();
+    assert!(headers.contains("cache-control: no-store"));
+    assert!(headers.contains("access-control-allow-origin: https://labels.dev1.makersbrain.net"));
     assert_eq!(
         request(
             port,

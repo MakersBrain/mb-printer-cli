@@ -567,7 +567,7 @@ impl JobExecutor {
                 "BLE transport is unavailable in this build",
             ));
         }
-        #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+        #[cfg(not(all(feature = "bluetooth-linux", target_os = "linux")))]
         if matches!(transport, ApiTransport::Rfcomm { .. }) {
             return Err(ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -831,7 +831,7 @@ impl JobExecutor {
                         .map_err(|error| (error.to_string(), None))
                         .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
                 }
-                #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+                #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
                 ApiTransport::Rfcomm { address, channel } => {
                     mb_printer_native::transports::rfcomm::RfcommTransport::bind(
                         0,
@@ -842,7 +842,7 @@ impl JobExecutor {
                     .map_err(|error| (error, None))
                     .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
                 }
-                #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+                #[cfg(not(all(feature = "bluetooth-linux", target_os = "linux")))]
                 ApiTransport::Rfcomm { .. } => {
                     Err(("RFCOMM support is unavailable in this build".into(), None))
                 }
