@@ -7,17 +7,7 @@ versioned path and a migration note.
 
 ## Unreleased
 
-- Replaced protocol-oriented top-level commands with the printer-centric
-  `discover`, `printer`, `print`, `document`, `model`, `asset`, `service`, and
-  `cloud` hierarchy.
-- Added a typed, versioned, atomically written and cross-process-locked printer
-  store with friendly names, defaults, multiple endpoints, persistent settings,
-  sole-printer selection, and migration from `connections.json`.
-- Unified bounded USB, serial, IPP/IPPS, BLE, and RFCOMM discovery with
-  deterministic results, unknown-device filtering, structured partial warnings,
-  probing, and strict mode.
-- Added global pretty, text, and versioned JSON result rendering plus independent
-  pretty/JSON Rust tracing with strict stdout/stderr separation.
+No changes yet.
 
 ## 0.1.0
 
