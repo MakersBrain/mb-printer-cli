@@ -4,7 +4,7 @@ set -eu
 
 release_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 output=${1:-$release_root/dist}
-features=${MB_PRINTER_RELEASE_FEATURES:-usb,bluetooth}
+features=${MB_PRINTER_RELEASE_FEATURES:-brother-admin,bluetooth}
 cyclonedx_version=0.5.7
 version=$(sed -n '0,/^version = "/s/^version = "\([^"]*\)"/\1/p' "$release_root/Cargo.toml")
 target=$(rustc -vV | sed -n 's/^host: //p')

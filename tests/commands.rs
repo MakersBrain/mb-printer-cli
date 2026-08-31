@@ -335,7 +335,7 @@ fn mocked_brother_and_wifi_status_workflows_decode_without_hardware() {
     let wifi = directory.path().join("wifi.txt");
     fs::write(
         &wifi,
-        "-43-61-66-65,-42,6,wpa2\n-47-75-65-73-74,-70,11,open\n",
+        "VAP,-43-61-66-65,x,x,6,-42,0,2\nVAP,-47-75-65-73-74,x,x,11,-70,0,1\n",
     )
     .unwrap();
     let scan = Command::new(binary)
@@ -350,12 +350,23 @@ fn mocked_brother_and_wifi_status_workflows_decode_without_hardware() {
     let text = String::from_utf8(scan.stdout).unwrap();
     assert!(text.contains("Cafe"));
     assert!(text.find("Cafe").unwrap() < text.find("Guest").unwrap());
-    let dry_status = Command::new(binary)
-        .args(["wifi", "status"])
+    let wifi_status = directory.path().join("wifi-status.txt");
+    fs::write(
+        &wifi_status,
+        "OBJBRNET\r\n\"458867:1\"\r\n\"458967.2:-c0-a8-01-64\"\r\n\"458877:-43-61-66-65\"\r\n\"458880:8\"\r\n\"458881:3\"\r\n\"459138.2:1\"\r\n\"459138.3:0\"\r\n",
+    )
+    .unwrap();
+    let decoded_status = Command::new(binary)
+        .args(["wifi", "status", "--input", wifi_status.to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(dry_status.status.success());
-    assert!(String::from_utf8_lossy(&dry_status.stdout).contains("hardwareClaim"));
+    assert!(decoded_status.status.success());
+    let status: serde_json::Value = serde_json::from_slice(&decoded_status.stdout).unwrap();
+    assert_eq!(status["connected"], true);
+    assert_eq!(status["ipAddress"], "192.168.1.100");
+    assert_eq!(status["ssid"], "Cafe");
+    assert_eq!(status["encryption"], "tkip-aes");
+    assert_eq!(status["authentication"], "wpa-psk");
 }
 
 #[test]

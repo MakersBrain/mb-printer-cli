@@ -54,6 +54,11 @@ fn openapi_contract_parses_and_has_unique_operations_and_local_refs() {
         "currentGrant",
         "rotateCurrentGrant",
         "revokeCurrentGrant",
+        "brotherWirelessStatus",
+        "brotherWirelessScan",
+        "prepareBrotherWirelessConfiguration",
+        "configureBrotherWireless",
+        "brotherSystemReport",
         "previewDocument",
         "submitJob",
         "jobEvents",
@@ -72,4 +77,38 @@ fn openapi_contract_parses_and_has_unique_operations_and_local_refs() {
             "unresolved local reference {reference}"
         );
     }
+    assert_eq!(
+        document["components"]["schemas"]["NetworkDiscoveryDetails"]["properties"]["scheme"]
+            ["enum"][1]
+            .as_str(),
+        Some("ipps")
+    );
+}
+
+#[test]
+fn device_derived_responses_are_documented_as_no_store() {
+    let document: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../docs/openapi.yaml")).unwrap();
+    let expected = "#/components/headers/NoStore";
+    for (path, method) in [
+        ("/v1/printers", "get"),
+        ("/v1/discovery", "post"),
+        ("/v1/status", "get"),
+        ("/v1/printers/{connection}/brother/wifi/status", "get"),
+        ("/v1/printers/{connection}/brother/wifi/scan", "post"),
+        ("/v1/printers/{connection}/brother/wifi/prepare", "post"),
+        ("/v1/printers/{connection}/brother/wifi/configure", "post"),
+        ("/v1/printers/{connection}/brother/report", "get"),
+    ] {
+        assert_eq!(
+            document["paths"][path][method]["responses"]["200"]["headers"]["Cache-Control"]["$ref"]
+                .as_str(),
+            Some(expected),
+            "{method} {path} must document Cache-Control: no-store"
+        );
+    }
+    assert_eq!(
+        document["components"]["headers"]["NoStore"]["schema"]["const"].as_str(),
+        Some("no-store")
+    );
 }

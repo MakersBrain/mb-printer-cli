@@ -20,13 +20,39 @@ mb-printer print label.mb-label.json --model tspl-generic --transport tcp://prin
 mb-printer print label.mb-label.json --model ql-1110nwb --transport ipps://brother.local:631/ipp/print
 ```
 
-Build with `--features usb` for libusb bulk discovery/execution, or
-`--features bluetooth` for BLE discovery, serialized writes and notification
-waits. On Linux, Bluetooth Classic uses BlueZ paired-device discovery and
-`rfcomm:MAC[@CHANNEL]`; the SDK binds the selected `/dev/rfcommN` endpoint.
-Tagged release artifacts carry the `-full` suffix and are built with both
-`usb,bluetooth`; Linux CI installs the D-Bus development headers required by
-the BLE backend. Minimal source builds retain an empty default feature set.
+Build with `--features usb` for CLI and SDK libusb bulk discovery/execution,
+`--features network` for SDK Brother Wi-Fi/IPP helpers and bounded DNS-SD
+discovery of both `_ipp._tcp` and `_ipps._tcp`, or
+`--features brother-admin` for both. `--features bluetooth` adds portable BLE
+discovery, serialized writes and notification waits without pulling vendored
+D-Bus into macOS builds. On Linux, use `--features bluetooth-linux` for the
+complete BLE, vendored D-Bus and Bluetooth Classic RFCOMM stack. Tagged full
+artifacts combine `brother-admin` with the platform Bluetooth feature. Minimal
+source builds retain an empty default feature set.
+
+Brother read-only administration uses stable USB identity rather than the
+first matching VID/PID. List devices, then pass the emitted selector (or the
+exact USB serial number) when more than one Brother printer is attached:
+
+```sh
+mb-printer usb list
+mb-printer status --device usb-device:04f9:209b:001:007
+mb-printer wifi status --device usb-device:04f9:209b:001:007
+mb-printer wifi scan --device usb-device:04f9:209b:001:007
+mb-printer usb report --device usb-device:04f9:209b:001:007 --output report.json
+```
+
+System reports are redacted by default and written with owner-only permissions.
+Use `--unsafe-unredacted` only for a protected local diagnostic artifact.
+
+Network discovery preserves the advertised secure scheme and never retries an
+IPPS endpoint as plaintext. The CLI and loopback discovery endpoint apply hard
+bounds to browse time, service count, TXT bytes and advertised addresses:
+
+```sh
+mb-printer network discover --timeout-ms 3000 --max-services 64
+mb-printer network status --timeout-ms 3000 --max-services 64
+```
 
 La Poste PDF commands use the SDK's shared pure-Rust PDF normalizer, validate A4
 media, extract occupied grid cells with provenance, and export exact
@@ -42,7 +68,8 @@ deterministic tests. Browser access uses an exact origin allowlist, independent
 loopback Host validation and valid-preflight-only Private Network Access. See
 `docs/openapi.yaml` for the versioned wire contract.
 
-USB and BLE implementations are feature-gated. Bluetooth Classic uses BlueZ's
+USB, network administration and BLE implementations are feature-gated.
+Bluetooth Classic uses the Linux-only `bluetooth-linux` feature and BlueZ's
 RFCOMM tooling; actual hardware discovery and
 printing still depend on platform permissions, drivers, and device-specific
 endpoint/characteristic values. Dry-run captures preserve the logical plan,

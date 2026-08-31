@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use crate::laposte::LaposteFormat;
@@ -29,6 +29,10 @@ pub enum Command {
     Export(RenderArgs),
     Printers,
     Discover,
+    Network {
+        #[command(subcommand)]
+        command: NetworkCommand,
+    },
     Usb {
         #[command(subcommand)]
         command: UsbCommand,
@@ -67,15 +71,53 @@ pub enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum NetworkCommand {
+    /// Discover IPP and IPPS printers advertised over DNS-SD.
+    Discover(NetworkDiscoveryArgs),
+    /// Discover printers and query their live IPP status.
+    Status(NetworkDiscoveryArgs),
+}
+
+#[derive(Debug, Args, Clone, Copy)]
+pub struct NetworkDiscoveryArgs {
+    /// Total DNS-SD browse deadline shared by IPP and IPPS.
+    #[arg(long, default_value_t = 3_000, value_parser = clap::value_parser!(u64).range(1..=10_000))]
+    pub timeout_ms: u64,
+    /// Maximum combined IPP and IPPS services returned.
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u16).range(1..=256))]
+    pub max_services: u16,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum UsbCommand {
     List,
     Info {
         address: String,
     },
     Report {
+        #[command(flatten)]
+        selector: UsbSelectorArgs,
         #[arg(short, long)]
         output: PathBuf,
+        #[arg(long, value_enum, default_value_t = ReportFormat::Json)]
+        format: ReportFormat,
+        /// Include network and device identifiers. The output file remains owner-only.
+        #[arg(long)]
+        unsafe_unredacted: bool,
     },
+}
+
+#[derive(Debug, Args, Clone, Default)]
+pub struct UsbSelectorArgs {
+    /// Stable `usb-device:VID:PID:BUS:ADDRESS` selector or exact USB serial number.
+    #[arg(long)]
+    pub device: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum ReportFormat {
+    Json,
+    Text,
 }
 
 #[derive(Debug, Subcommand)]
@@ -84,11 +126,15 @@ pub enum WifiCommand {
         /// Parse a captured AVAILABLEWLAN reply instead of contacting hardware.
         #[arg(long)]
         input: Option<PathBuf>,
+        #[command(flatten)]
+        selector: UsbSelectorArgs,
     },
     Status {
         /// Parse a captured OBJBRNET reply instead of contacting hardware.
         #[arg(long)]
         input: Option<PathBuf>,
+        #[command(flatten)]
+        selector: UsbSelectorArgs,
     },
     Encode {
         ssid: String,
@@ -182,6 +228,8 @@ pub struct PrinterTarget {
     /// Decode a captured 32-byte Brother raster status reply.
     #[arg(long)]
     pub response: Option<PathBuf>,
+    #[command(flatten)]
+    pub selector: UsbSelectorArgs,
 }
 
 #[derive(Debug, Args)]
@@ -341,6 +389,13 @@ pub enum ApiCommand {
         #[arg(long, default_value_t = 120)]
         expires_seconds: u64,
     },
+    /// Create a one-time secret for a short-lived browser administrator grant.
+    #[command(name = "pair-admin")]
+    PairAdmin {
+        /// Lifetime of the one-time secret (1–600 seconds).
+        #[arg(long, default_value_t = 120, value_parser = clap::value_parser!(u64).range(1..=600))]
+        expires_seconds: u64,
+    },
     Grants,
     Revoke {
         id: String,
@@ -349,6 +404,14 @@ pub enum ApiCommand {
         id: String,
         #[arg(long, default_value_t = 2_592_000)]
         expires_seconds: u64,
+    },
+    /// Approve one pending browser Wi-Fi configuration request on this machine.
+    ApproveWifi {
+        /// Opaque approval ID returned by the browser prepare request.
+        id: String,
+        /// Skip the interactive confirmation prompt.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -406,6 +469,61 @@ mod tests {
                 "x.pdf",
                 "--laposte-format",
                 "L99A"
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn network_discovery_arguments_are_bounded() {
+        let cli = Cli::try_parse_from([
+            "mb-printer",
+            "network",
+            "discover",
+            "--timeout-ms",
+            "2500",
+            "--max-services",
+            "12",
+        ])
+        .unwrap();
+        let Command::Network {
+            command: NetworkCommand::Discover(args),
+        } = cli.command
+        else {
+            panic!()
+        };
+        assert_eq!(args.timeout_ms, 2500);
+        assert_eq!(args.max_services, 12);
+        assert!(
+            Cli::try_parse_from(["mb-printer", "network", "status", "--timeout-ms", "10001"])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn administrator_pairing_secret_expiry_is_bounded() {
+        let cli = Cli::try_parse_from([
+            "mb-printer",
+            "api",
+            "pair-admin",
+            "--expires-seconds",
+            "300",
+        ])
+        .unwrap();
+        let Command::Api {
+            command: ApiCommand::PairAdmin { expires_seconds },
+        } = cli.command
+        else {
+            panic!()
+        };
+        assert_eq!(expires_seconds, 300);
+        assert!(
+            Cli::try_parse_from([
+                "mb-printer",
+                "api",
+                "pair-admin",
+                "--expires-seconds",
+                "601",
             ])
             .is_err()
         );

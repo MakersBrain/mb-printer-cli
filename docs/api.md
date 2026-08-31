@@ -11,6 +11,18 @@ a grant's bearer token atomically while preserving its bound origin. Browsers
 can inspect, rotate, or revoke only their own grant through `/v1/grants/me` and
 its `/rotate` and `/revoke` subroutes.
 
+Changing printer settings needs a distinct, short-lived administrator grant.
+Administrator pairing has its own default-off switch. Before using the browser
+administration flow, set both `enable_brother_wifi_configuration` and
+`enable_brother_wifi_configuration_pairing` to `true`, then restart the
+service. After a local person intentionally runs
+`mb-printer api pair-admin`, the
+browser exchanges that one-time secret at `POST /v1/admin/pair`; it cannot use
+`POST /v1/pair` and normal pairing secrets cannot use the administrator route.
+The administrator token is origin-bound, capped at ten minutes, and returned
+with `Cache-Control: no-store`. Paste the one-time secret directly into the
+editor and do not log or save it.
+
 Every non-pairing request needs browser `Origin`, loopback `Host`, and
 `Authorization: Bearer TOKEN`. `POST /v1/jobs` accepts canonical SDK v4 or the
 editor v4 representation, `printerId`, copies, density, `rotation` (0/90/180/270)
@@ -41,8 +53,10 @@ for different request bytes returns HTTP 409 and never starts a write.
 Bounded job state and resumable request metadata persist at `jobs_path`.
 Interrupted non-terminal work is restored as `outcome-unknown`; completed and
 cancelled jobs remain queryable after restart. Saved connections dispatch the
-same TCP, IPP/IPPS, serial, RFCOMM, file, feature-gated USB, or feature-gated BLE adapter
-as an explicit request.
+same TCP, IPP/IPPS, serial, RFCOMM, file, feature-gated USB, or feature-gated
+BLE adapter as an explicit request. RFCOMM requires the Linux-only
+`bluetooth-linux` feature; the portable `bluetooth` feature enables BLE
+without vendored D-Bus.
 
 Browser preflights receive `Access-Control-Allow-Origin` only for an exact
 configured origin. GET, POST, OPTIONS, Authorization, Content-Type and
@@ -66,7 +80,29 @@ workspace. Keep the API on loopback; never add port 9847 to Cloudflare Tunnel.
 
 `POST /v1/connection` persists a bounded connection definition. Discovery and
 `GET /v1/status?connection=ID` expose live backend-reported transport, status
-and media data. A persisted `kind: "ipp"` connection uses the same endpoint for
+and media data. Their response-only `operations` array is derived from the
+model and concrete transport; it is never written to connection files. A USB
+QL-1110NWB or QL-1115NWB advertises `wifi-status`, `wifi-scan`,
+`system-report`, and—only when the local administrator has opted in—
+`wifi-configure` when attached by USB, while a USB QL-1100 advertises
+`system-report` only. Network, Bluetooth, and serial
+connections do not advertise these USB administration operations. The
+`wifi-configure` route still requires a separate short-lived administrator
+grant and a local, one-time approval. It is disabled by default. To opt in on
+the printer host, set the flag and restart the service:
+
+```sh
+mb-printer config set enable_brother_wifi_configuration true
+mb-printer config set enable_brother_wifi_configuration_pairing true
+# restart `mb-printer api serve`
+```
+
+Disable either independently with the corresponding `config unset` command.
+Network-enabled builds aggregate bounded DNS-SD `_ipp._tcp` and
+`_ipps._tcp` advertisements into `POST /v1/discovery`. Each IPP candidate keeps
+the full advertised URI in `address` and typed scheme, host, resource and
+address metadata in `network`; arbitrary TXT properties are not returned.
+IPPS candidates are never retried as plaintext. A persisted `kind: "ipp"` connection uses the same endpoint for
 Get-Printer-Attributes status and Brother raster Print-Job submission. `ipps://`
 uses mandatory hostname and certificate verification; private or self-signed
 printer certificates can be added explicitly with `certificatePem`, and there
@@ -74,6 +110,23 @@ is no insecure TLS or silent downgrade mode. Brother TCP uses IPP by default (or
 `statusMode` is `raster`); readable serial, USB, BLE and RFCOMM transports use
 the Brother status frame. Test-only injected probes remain available without
 claiming physical hardware acceptance.
+
+Brother USB diagnostics use `GET /v1/printers/ID/brother/wifi/status`,
+`POST /v1/printers/ID/brother/wifi/scan`, and
+`GET /v1/printers/ID/brother/report`. Their successful responses are always
+`Cache-Control: no-store`; reports are redacted. Wireless configuration is
+USB-only and requires a separate short-lived **administrator** grant, not a
+normal print grant. The browser sends the complete settings (including its
+password) to `POST /v1/printers/ID/brother/wifi/prepare`. The API validates
+them and retains only a cryptographic fingerprint, returning a non-secret
+review and `approvalId`. A local person must approve that exact request within
+120 seconds with `mb-printer api approve-wifi APPROVAL_ID` (or `--yes` for an
+intentional non-interactive local workflow). The browser then repeats the same settings and `approvalId` at
+`POST /v1/printers/ID/brother/wifi/configure`. The approval is origin-,
+administrator-, printer- and settings-bound, consumed once before the USB
+command is attempted, and cannot be replayed. Neither response includes the
+password; do not log either request. Keep USB or Bluetooth connected as the
+recovery path while the printer reboots.
 
 Document routes are `POST /v1/documents/validate`, `/preview`, and
 `/export?format=png|pdf`. Other authenticated routes list printer definitions,

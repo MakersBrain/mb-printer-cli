@@ -12,7 +12,10 @@ strict portable v4; use `validate` or `inspect` to check the normalized input.
   is invalid as soon as the one-time replacement token is printed.
 - `421`: a non-loopback `Host` was rejected independently of CORS.
 - Serial open failure: check device permissions and `--baud`.
-- BLE build failure on Linux: install D-Bus development headers and
-  `pkg-config`; runtime acceptance also requires BlueZ and adapter permission.
+- BLE/RFCOMM build failure on Linux: use `--features bluetooth-linux` for the
+  vendored D-Bus build; runtime acceptance also requires BlueZ and adapter
+  permission. A Linux build using only `bluetooth` needs the system D-Bus
+  development package and `pkg-config`. Use portable `bluetooth` on macOS and
+  Windows.
 - `outcome-unknown` or `cancelled-partial`: inspect the physical printer before
   explicitly deciding whether to retry. Jobs are never replayed automatically.

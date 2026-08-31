@@ -16,8 +16,13 @@ include = ["src/**", "tests/**", "docs/**", "scripts/**", ".github/**", "Cargo.t
 
 [features]
 default = []
-usb = ["dep:rusb"]
-bluetooth = ["dep:btleplug", "mb-printer-native/ble-vendored-dbus", "mb-printer-native/bluetooth-rfcomm"]
+usb = ["dep:rusb", "mb-printer-native/usb"]
+network = ["mb-printer-native/wifi", "mb-printer-native/dns-sd"]
+brother-admin = ["usb", "network"]
+bluetooth = ["dep:btleplug", "mb-printer-native/ble"]
+# Linux-only full Bluetooth stack. Keep vendored D-Bus and RFCOMM out of the
+# portable BLE feature so macOS builds never compile libdbus-sys.
+bluetooth-linux = ["bluetooth", "mb-printer-native/ble-vendored-dbus", "mb-printer-native/bluetooth-rfcomm"]
 
 [[bin]]
 name = "mb-printer"

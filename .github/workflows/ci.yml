@@ -27,5 +27,9 @@ jobs:
       - run: sh scripts/check_release_version.sh --manifest-only
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked --all-targets
+      - run: cargo check --locked --all-targets --features usb
+      - run: cargo check --locked --all-targets --features network
+      - run: cargo check --locked --all-targets --features brother-admin
+      - run: cargo check --locked --all-targets --features bluetooth
       - run: cargo check --locked --all-targets --all-features
       - run: cargo build --release --locked --all-features

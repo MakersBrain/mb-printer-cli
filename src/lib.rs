@@ -10,6 +10,9 @@ pub mod config;
 pub mod device;
 pub mod jobs;
 pub mod laposte;
+#[cfg(feature = "network")]
+pub mod network;
+pub mod printer_ops;
 pub mod raster;
 pub mod transport;
 

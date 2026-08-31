@@ -2,13 +2,17 @@
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{Query, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Path as AxumPath, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+#[cfg(test)]
+use std::collections::HashSet;
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -60,6 +64,16 @@ pub struct ApiState {
     connection_executions: Arc<RwLock<HashMap<String, Arc<std::sync::Mutex<()>>>>>,
     injected_devices: Arc<RwLock<Vec<crate::transport::NativeDevice>>>,
     injected_probes: Arc<RwLock<HashMap<String, ProbeResult>>>,
+    #[cfg(test)]
+    injected_wireless_statuses: Arc<RwLock<HashMap<String, crate::printer_ops::WirelessStatus>>>,
+    #[cfg(test)]
+    injected_wireless_scans:
+        Arc<RwLock<HashMap<String, Vec<mb_printer_core::protocol::brother::wifi::AccessPoint>>>>,
+    #[cfg(test)]
+    injected_system_reports:
+        Arc<RwLock<HashMap<String, mb_printer_core::protocol::brother::report::SystemReport>>>,
+    #[cfg(test)]
+    injected_wireless_configurations: Arc<RwLock<HashSet<(String, String)>>>,
 }
 impl ApiState {
     pub fn new(auth: AuthStore, config: Config) -> Self {
@@ -83,6 +97,14 @@ impl ApiState {
             connection_executions: Arc::new(RwLock::new(HashMap::new())),
             injected_devices: Arc::new(RwLock::new(Vec::new())),
             injected_probes: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            injected_wireless_statuses: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            injected_wireless_scans: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            injected_system_reports: Arc::new(RwLock::new(HashMap::new())),
+            #[cfg(test)]
+            injected_wireless_configurations: Arc::new(RwLock::new(HashSet::new())),
         }
     }
     pub async fn inject_devices(&self, devices: Vec<crate::transport::NativeDevice>) {
@@ -107,6 +129,40 @@ impl ApiState {
             .write()
             .await
             .insert(id.to_owned(), result);
+    }
+
+    #[cfg(test)]
+    async fn inject_brother_reads(
+        &self,
+        id: &str,
+        status: crate::printer_ops::WirelessStatus,
+        scan: Vec<mb_printer_core::protocol::brother::wifi::AccessPoint>,
+        report: mb_printer_core::protocol::brother::report::SystemReport,
+    ) {
+        self.injected_wireless_statuses
+            .write()
+            .await
+            .insert(id.into(), status);
+        self.injected_wireless_scans
+            .write()
+            .await
+            .insert(id.into(), scan);
+        self.injected_system_reports
+            .write()
+            .await
+            .insert(id.into(), report);
+    }
+
+    #[cfg(test)]
+    async fn inject_brother_wireless_configuration(
+        &self,
+        connection: &str,
+        settings: &mb_printer_core::protocol::brother::wifi::WirelessSettings,
+    ) {
+        self.injected_wireless_configurations
+            .write()
+            .await
+            .insert((connection.into(), wireless_settings_fingerprint(settings)));
     }
 
     pub(crate) async fn submit_cloud_job(
@@ -207,8 +263,23 @@ fn save_connections(
 pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(serde_json::json!({"error": self.1}))).into_response()
+        let mut response = (self.0, Json(serde_json::json!({"error": self.1}))).into_response();
+        response
+            .headers_mut()
+            .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+        response
     }
+}
+
+/// Return sensitive, device-derived JSON without allowing browsers or
+/// intermediaries to retain it. Brother administration routes should use the
+/// same helper when they are added.
+fn no_store_json<T: Serialize>(value: T) -> Response {
+    let mut response = Json(value).into_response();
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 fn origin(headers: &HeaderMap) -> Result<&str, ApiError> {
     headers
@@ -245,6 +316,23 @@ async fn authorize(state: &ApiState, headers: &HeaderMap) -> Result<Uuid, ApiErr
         Ok(grant.id)
     } else {
         Err(ApiError(StatusCode::UNAUTHORIZED, "invalid grant"))
+    }
+}
+
+/// State-changing Brother administration is deliberately separate from the
+/// ordinary, long-lived print grant. An administrator token is short-lived,
+/// origin-bound, and is only issued after local confirmation.
+async fn authorize_admin(state: &ApiState, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+    validate_host(headers)?;
+    let o = origin(headers)?;
+    let token = bearer(headers)?;
+    if let Some(grant) = state.auth.read().await.authenticate_admin(token, o) {
+        Ok(grant.id)
+    } else {
+        Err(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "administrator grant required",
+        ))
     }
 }
 
@@ -363,10 +451,17 @@ async fn pair(
     {
         return Err(ApiError(StatusCode::FORBIDDEN, "origin not allowed"));
     }
-    let (grant_id, token) = state
-        .auth
-        .write()
-        .await
+    let mut auth = state.auth.write().await;
+    // Pairing secrets are created by a separate `mb-printer api pair`
+    // process. Refresh while holding the service lock so the exchange and
+    // one-time consumption operate on one durable-store generation.
+    auth.reload().map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "grant persistence failed",
+        )
+    })?;
+    let (grant_id, token) = auth
         .exchange(&request.secret, o, Duration::from_secs(30 * 24 * 3600))
         .map_err(|_| {
             ApiError(
@@ -385,6 +480,53 @@ async fn pair(
     }))
 }
 
+/// Exchanges a locally-created administrator pairing secret. This must remain
+/// separate from `/v1/pair`: a normal print secret can never mint a token that
+/// is allowed to alter printer state.
+async fn pair_admin(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    Json(request): Json<PairRequest>,
+) -> Result<Response, ApiError> {
+    validate_host(&headers)?;
+    let o = origin(&headers)?;
+    if !state
+        .config
+        .allowed_origins
+        .iter()
+        .any(|allowed| allowed == o)
+    {
+        return Err(ApiError(StatusCode::FORBIDDEN, "origin not allowed"));
+    }
+    require_brother_wifi_configuration_pairing(&state)?;
+    let mut auth = state.auth.write().await;
+    // See `/v1/pair`: the administrator pairing secret is written by the
+    // local CLI after this long-running service may already have started.
+    auth.reload().map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "grant persistence failed",
+        )
+    })?;
+    let (grant_id, token) = auth
+        .exchange_admin(&request.secret, o, crate::auth::ADMIN_GRANT_MAX_TTL)
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "grant persistence failed",
+            )
+        })?
+        .ok_or(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "invalid or expired administrator pairing secret",
+        ))?;
+    Ok(no_store_json(PairResponse {
+        grant_id,
+        token,
+        expires_at: (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339(),
+    }))
+}
+
 async fn capabilities(
     State(state): State<ApiState>,
     headers: HeaderMap,
@@ -394,30 +536,13 @@ async fn capabilities(
         serde_json::json!({"service":"mb-printer","version":VERSION,"api":"v1","features":["documents","preview-png","jobs","job-idempotency","job-fit","self-service-grants","dual-stack-loopback","assets","laposte","file-transport","tcp-transport","serial-transport","ipp-transport","ipps-transport"],"max_document_bytes":state.config.max_document_bytes,"printer_definition_count":capabilities::bundled().len()}),
     ))
 }
-async fn printers(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, ApiError> {
+async fn printers(State(state): State<ApiState>, headers: HeaderMap) -> Result<Response, ApiError> {
     authorize(&state, &headers).await?;
     let devices = discovered_devices(&state).await;
+    let wifi_configuration_enabled = state.config.enable_brother_wifi_configuration;
     let discovered = devices
         .into_iter()
-        .map(|device| {
-            let haystack = format!(
-                "{} {}",
-                device.name.as_deref().unwrap_or(""),
-                device.address
-            )
-            .to_ascii_lowercase();
-            let model = capabilities::bundled()
-                .into_iter()
-                .find(|definition| {
-                    haystack.contains(&definition.id.to_ascii_lowercase())
-                        || haystack.contains(&definition.name.to_ascii_lowercase())
-                })
-                .map(|definition| definition.id);
-            serde_json::json!({"source":"discovery","device":device,"matchedModel":model})
-        })
+        .map(|device| discovered_printer_json(device, wifi_configuration_enabled))
         .collect::<Vec<_>>();
     let configured = state
         .connections
@@ -426,18 +551,19 @@ async fn printers(
         .values()
         .cloned()
         .collect::<Vec<_>>();
-    Ok(Json(
-        serde_json::json!({"printers":{"discovered":discovered,"configured":configured},"definitions":capabilities::bundled()}),
+    Ok(no_store_json(
+        serde_json::json!({"printers":{"discovered":discovered,"configured":configured.iter().map(|connection| connection_json(connection, wifi_configuration_enabled)).collect::<Vec<_>>()},"definitions":capabilities::bundled()}),
     ))
 }
 async fn discovery(
     State(state): State<ApiState>,
     headers: HeaderMap,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Response, ApiError> {
     authorize(&state, &headers).await?;
     let devices = discovered_devices(&state).await;
-    Ok(Json(
-        serde_json::json!({"devices":devices,"supportedTransports":["file","tcp","serial","usb","ble","rfcomm","ipp"]}),
+    let wifi_configuration_enabled = state.config.enable_brother_wifi_configuration;
+    Ok(no_store_json(
+        serde_json::json!({"devices":devices.into_iter().map(|device| discovery_device_json(device, wifi_configuration_enabled)).collect::<Vec<_>>(),"supportedTransports":["file","tcp","serial","usb","ble","rfcomm","ipp"]}),
     ))
 }
 #[derive(Deserialize)]
@@ -451,7 +577,7 @@ async fn connection(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Json(request): Json<ConnectionRequest>,
-) -> Result<Json<Connection>, ApiError> {
+) -> Result<Response, ApiError> {
     authorize(&state, &headers).await?;
     if request.id.trim().is_empty() || capabilities::by_id(&request.model).is_none() {
         return Err(ApiError(
@@ -499,7 +625,131 @@ async fn connection(
     }
     connections.insert(configured.id.clone(), configured.clone());
     save_connections(&state, &connections)?;
-    Ok(Json(configured))
+    Ok(no_store_json(connection_json(
+        &configured,
+        state.config.enable_brother_wifi_configuration,
+    )))
+}
+
+/// Return the operations that are safe to advertise for a concrete endpoint.
+///
+/// The persisted connection is intentionally not changed: operations depend on
+/// the *current transport*, while saved connection files remain portable across
+/// older CLI versions and across USB/network use. In particular, Brother
+/// administration routes only accept locally attached USB devices.
+fn connection_operations(connection: &Connection, wifi_configuration_enabled: bool) -> Vec<String> {
+    let usb = connection.transport["kind"] == "usb";
+    let mut operations: Vec<String> = capabilities::by_id(&connection.model)
+        .map(|definition| {
+            definition
+                .operations
+                .into_iter()
+                // Model data describes the protocol operation, whereas the
+                // API response must also respect this concrete endpoint.
+                // Brother administration never leaves the local USB path.
+                .filter(|operation| {
+                    usb || !matches!(
+                        operation,
+                        mb_printer_core::capabilities::PrinterOperation::SystemReport
+                            | mb_printer_core::capabilities::PrinterOperation::WifiStatus
+                            | mb_printer_core::capabilities::PrinterOperation::WifiScan
+                            | mb_printer_core::capabilities::PrinterOperation::WifiConfigure
+                    )
+                })
+                .filter(|operation| {
+                    wifi_configuration_enabled
+                        || !matches!(
+                            operation,
+                            mb_printer_core::capabilities::PrinterOperation::WifiConfigure
+                        )
+                })
+                .filter_map(|operation| serde_json::to_value(operation).ok())
+                .filter_map(|operation| operation.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    operations.sort();
+    operations.dedup();
+    operations
+}
+
+fn connection_json(connection: &Connection, wifi_configuration_enabled: bool) -> serde_json::Value {
+    serde_json::json!({
+        "id": connection.id,
+        "model": connection.model,
+        "transport": connection.transport,
+        "status": connection.status,
+        "media": connection.media,
+        "operations": connection_operations(connection, wifi_configuration_enabled),
+    })
+}
+
+fn matched_model(device: &crate::transport::NativeDevice) -> Option<String> {
+    let haystack = format!(
+        "{} {} {}",
+        device.name.as_deref().unwrap_or(""),
+        device.address,
+        device.ieee1284_device_id.as_deref().unwrap_or(""),
+    )
+    .to_ascii_lowercase();
+    capabilities::bundled()
+        .into_iter()
+        .find(|definition| {
+            haystack.contains(&definition.id.to_ascii_lowercase())
+                || haystack.contains(&definition.name.to_ascii_lowercase())
+        })
+        .map(|definition| definition.id)
+}
+
+fn discovery_device_json(
+    device: crate::transport::NativeDevice,
+    wifi_configuration_enabled: bool,
+) -> serde_json::Value {
+    let model = matched_model(&device);
+    let connection = Connection {
+        id: String::new(),
+        model: model.clone().unwrap_or_default(),
+        transport: serde_json::json!({"kind": device.transport.clone()}),
+        status: String::new(),
+        media: None,
+    };
+    let mut value = serde_json::to_value(device).expect("native discovery device serializes");
+    let object = value
+        .as_object_mut()
+        .expect("native discovery device serializes to object");
+    object.insert(
+        "matchedModel".into(),
+        model.map_or(serde_json::Value::Null, serde_json::Value::String),
+    );
+    object.insert(
+        "operations".into(),
+        serde_json::to_value(connection_operations(
+            &connection,
+            wifi_configuration_enabled,
+        ))
+        .expect("operations serialize"),
+    );
+    value
+}
+
+fn discovered_printer_json(
+    device: crate::transport::NativeDevice,
+    wifi_configuration_enabled: bool,
+) -> serde_json::Value {
+    let model = matched_model(&device);
+    let connection = Connection {
+        id: String::new(),
+        model: model.clone().unwrap_or_default(),
+        transport: serde_json::json!({"kind": device.transport.clone()}),
+        status: String::new(),
+        media: None,
+    };
+    serde_json::json!({
+        "source": "discovery",
+        "device": device,
+        "matchedModel": model,
+        "operations": connection_operations(&connection, wifi_configuration_enabled),
+    })
 }
 fn probe_transport(transport: &serde_json::Value) -> Result<ProbeResult, ApiError> {
     let kind = transport["kind"].as_str().unwrap_or_default();
@@ -528,7 +778,7 @@ fn probe_transport(transport: &serde_json::Value) -> Result<ProbeResult, ApiErro
                 .map(|_| ())
                 .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "serial probe failed"))
         }
-        #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+        #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
         "rfcomm" => {
             let address = transport["address"].as_str().ok_or(ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -539,7 +789,7 @@ fn probe_transport(transport: &serde_json::Value) -> Result<ProbeResult, ApiErro
                 .map(|_| ())
                 .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "RFCOMM probe failed"))
         }
-        #[cfg(not(all(feature = "bluetooth", target_os = "linux")))]
+        #[cfg(not(all(feature = "bluetooth-linux", target_os = "linux")))]
         "rfcomm" => {
             return Err(ApiError(
                 StatusCode::BAD_GATEWAY,
@@ -559,16 +809,24 @@ fn probe_transport(transport: &serde_json::Value) -> Result<ProbeResult, ApiErro
                 .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "file probe failed"))
         }
         #[cfg(feature = "usb")]
-        "usb" => crate::transport::usb::UsbTransport::open(
-            transport["vid"].as_u64().unwrap_or(0) as u16,
-            transport["pid"].as_u64().unwrap_or(0) as u16,
-            transport["interface"].as_u64().unwrap_or(0) as u8,
-            transport["out"].as_u64().unwrap_or(0) as u8,
-            transport["input"].as_u64().map(|value| value as u8),
-            128,
-        )
-        .map(|_| ())
-        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "USB probe failed")),
+        "usb" => {
+            if let Some(device) = transport["device"].as_str() {
+                crate::printer_ops::usb_brother_status(Some(device))
+                    .map(|_| ())
+                    .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "USB probe failed"))
+            } else {
+                crate::transport::usb::UsbTransport::open(
+                    transport["vid"].as_u64().unwrap_or(0) as u16,
+                    transport["pid"].as_u64().unwrap_or(0) as u16,
+                    transport["interface"].as_u64().unwrap_or(0) as u8,
+                    transport["out"].as_u64().unwrap_or(0) as u8,
+                    transport["input"].as_u64().map(|value| value as u8),
+                    128,
+                )
+                .map(|_| ())
+                .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "USB probe failed"))
+            }
+        }
         #[cfg(not(feature = "usb"))]
         "usb" => {
             return Err(ApiError(
@@ -609,6 +867,14 @@ async fn discovered_devices(state: &ApiState) -> Vec<crate::transport::NativeDev
     devices.extend(
         crate::transport::bluetooth::discover()
             .await
+            .unwrap_or_default(),
+    );
+    #[cfg(all(feature = "network", not(test)))]
+    devices.extend(
+        tokio::task::spawn_blocking(|| crate::network::discover(Default::default()))
+            .await
+            .ok()
+            .and_then(Result::ok)
             .unwrap_or_default(),
     );
     devices.sort_by(|left, right| {
@@ -670,11 +936,17 @@ fn brother_transport_status<T: mb_printer_native::Transport>(
             ));
         }
     };
-    let status = crate::device::brother_status(&bytes)
+    let status = crate::printer_ops::parse_brother_status(&bytes)
         .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "invalid Brother status"))?;
-    Ok(ProbeResult {
+    Ok(brother_status_probe(status))
+}
+
+fn brother_status_probe(
+    status: mb_printer_core::protocol::brother::status::BrotherStatus,
+) -> ProbeResult {
+    ProbeResult {
         status: if status.errors.is_empty() {
-            status.phase.clone()
+            status.phase.into()
         } else {
             "error".into()
         },
@@ -686,7 +958,7 @@ fn brother_transport_status<T: mb_printer_native::Transport>(
             "phase":status.phase,
             "errors":status.errors
         })),
-    })
+    }
 }
 
 fn brother_ipp_status(address: &str) -> Result<ProbeResult, ApiError> {
@@ -849,6 +1121,11 @@ async fn printer_status_async(connection: &Connection) -> Result<ProbeResult, Ap
         .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "serial status task crashed"))?,
         #[cfg(feature = "usb")]
         "usb" => tokio::task::spawn_blocking(move || {
+            if let Some(device) = transport["device"].as_str() {
+                return crate::printer_ops::usb_brother_status(Some(device))
+                    .map(brother_status_probe)
+                    .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "USB status failed"));
+            }
             let mut target = crate::transport::usb::UsbTransport::open(
                 transport["vid"].as_u64().unwrap_or(0) as u16,
                 transport["pid"].as_u64().unwrap_or(0) as u16,
@@ -873,7 +1150,7 @@ async fn printer_status_async(connection: &Connection) -> Result<ProbeResult, Ap
                 .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "BLE status connection failed"))?;
             brother_transport_status(&mut target)
         }
-        #[cfg(all(feature = "bluetooth", target_os = "linux"))]
+        #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
         "rfcomm" => tokio::task::spawn_blocking(move || {
             let address = transport["address"].as_str().ok_or(ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -899,7 +1176,7 @@ async fn status(
     State(state): State<ApiState>,
     headers: HeaderMap,
     Query(query): Query<StatusQuery>,
-) -> Result<Json<serde_json::Value>, ApiError> {
+) -> Result<Response, ApiError> {
     authorize(&state, &headers).await?;
     let connections = state.connections.read().await;
     let selected = query
@@ -909,7 +1186,7 @@ async fn status(
         .cloned();
     let configured = connections.values().cloned().collect::<Vec<_>>();
     drop(connections);
-    Ok(Json(match selected {
+    Ok(no_store_json(match selected {
         Some(value) => {
             let live =
                 if let Some(probe) = state.injected_probes.read().await.get(&value.id).cloned() {
@@ -921,12 +1198,452 @@ async fn status(
                 Ok(probe) => (true, probe.status, probe.media.or(value.media.clone())),
                 Err(_) => (false, "unavailable".into(), value.media.clone()),
             };
-            serde_json::json!({"connection":value,"connected":connected,"status":status,"media":media})
+            serde_json::json!({"connection":connection_json(&value, state.config.enable_brother_wifi_configuration),"connected":connected,"status":status,"media":media})
         }
         None => {
-            serde_json::json!({"connections":configured,"connected":false,"status":"not-connected","media":null})
+            serde_json::json!({"connections":configured.iter().map(|connection| connection_json(connection, state.config.enable_brother_wifi_configuration)).collect::<Vec<_>>(),"connected":false,"status":"not-connected","media":null})
         }
     }))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BrotherReadOperation {
+    Wireless,
+    Report,
+}
+
+async fn brother_wireless_status(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(connection): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    authorize(&state, &headers).await?;
+    let (_, selector) =
+        brother_usb_connection_async(&state, &connection, BrotherReadOperation::Wireless).await?;
+    #[cfg(test)]
+    if let Some(status) = state
+        .injected_wireless_statuses
+        .read()
+        .await
+        .get(&connection)
+        .cloned()
+    {
+        return Ok(no_store_json(status));
+    }
+    #[cfg(feature = "usb")]
+    {
+        let status = tokio::task::spawn_blocking(move || {
+            crate::printer_ops::usb_wireless_status(Some(&selector))
+        })
+        .await
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "wireless status task crashed"))?
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "wireless status failed"))?;
+        Ok(no_store_json(status))
+    }
+    #[cfg(not(feature = "usb"))]
+    {
+        let _ = selector;
+        Err(ApiError(
+            StatusCode::NOT_IMPLEMENTED,
+            "USB support is unavailable in this build",
+        ))
+    }
+}
+
+#[cfg(any(feature = "usb", test))]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrotherWirelessScanResponse {
+    access_points: Vec<mb_printer_core::protocol::brother::wifi::AccessPoint>,
+}
+
+async fn brother_wireless_scan(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(connection): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    authorize(&state, &headers).await?;
+    let (_, selector) =
+        brother_usb_connection_async(&state, &connection, BrotherReadOperation::Wireless).await?;
+    #[cfg(test)]
+    if let Some(access_points) = state
+        .injected_wireless_scans
+        .read()
+        .await
+        .get(&connection)
+        .cloned()
+    {
+        return Ok(no_store_json(BrotherWirelessScanResponse { access_points }));
+    }
+    #[cfg(feature = "usb")]
+    {
+        let access_points = tokio::task::spawn_blocking(move || {
+            crate::printer_ops::usb_wireless_scan(Some(&selector))
+        })
+        .await
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "wireless scan task crashed"))?
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "wireless scan failed"))?;
+        Ok(no_store_json(BrotherWirelessScanResponse { access_points }))
+    }
+    #[cfg(not(feature = "usb"))]
+    {
+        let _ = selector;
+        Err(ApiError(
+            StatusCode::NOT_IMPLEMENTED,
+            "USB support is unavailable in this build",
+        ))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrotherWirelessSettingsRequest {
+    ssid: String,
+    password: String,
+    encryption: mb_printer_core::protocol::brother::wifi::WirelessEncryption,
+    authentication: mb_printer_core::protocol::brother::wifi::WirelessAuthentication,
+    #[serde(default = "default_true")]
+    infrastructure: bool,
+    #[serde(default)]
+    wireless_direct: bool,
+    #[serde(default = "default_true")]
+    reboot: bool,
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+impl BrotherWirelessSettingsRequest {
+    fn settings(&self) -> mb_printer_core::protocol::brother::wifi::WirelessSettings {
+        mb_printer_core::protocol::brother::wifi::WirelessSettings {
+            ssid: self.ssid.clone(),
+            password: self.password.clone(),
+            encryption: self.encryption,
+            authentication: self.authentication,
+            infrastructure: self.infrastructure,
+            wireless_direct: self.wireless_direct,
+            reboot: self.reboot,
+        }
+    }
+
+    fn validate(
+        &self,
+    ) -> Result<mb_printer_core::protocol::brother::wifi::WirelessSettings, ApiError> {
+        let settings = self.settings();
+        settings.command().map_err(|_| {
+            ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "invalid wireless settings",
+            )
+        })?;
+        Ok(settings)
+    }
+}
+
+fn wireless_settings_fingerprint(
+    settings: &mb_printer_core::protocol::brother::wifi::WirelessSettings,
+) -> String {
+    let mut hash = Sha256::new();
+    hash.update(b"mb-printer-wifi-approval-v1\0");
+    for part in [
+        settings.ssid.as_bytes(),
+        settings.password.as_bytes(),
+        &[settings.encryption.code()],
+        &[settings.authentication.code()],
+        &[u8::from(settings.infrastructure)],
+        &[u8::from(settings.wireless_direct)],
+        &[u8::from(settings.reboot)],
+    ] {
+        hash.update((part.len() as u32).to_be_bytes());
+        hash.update(part);
+    }
+    URL_SAFE_NO_PAD.encode(hash.finalize())
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrotherWirelessPrepareRequest {
+    #[serde(flatten)]
+    settings: BrotherWirelessSettingsRequest,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrotherWirelessPrepareResponse {
+    approval_id: Uuid,
+    expires_at: u64,
+    connection: String,
+    device: String,
+    ssid: String,
+    encryption: mb_printer_core::protocol::brother::wifi::WirelessEncryption,
+    authentication: mb_printer_core::protocol::brother::wifi::WirelessAuthentication,
+    infrastructure: bool,
+    wireless_direct: bool,
+    reboot: bool,
+    recovery: &'static str,
+}
+
+/// Returns a non-secret review of a pending wireless change and records an
+/// opaque, short-lived manifest for local approval. Raw settings and the
+/// password are never persisted in the approval store.
+async fn brother_wireless_prepare(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(connection): AxumPath<String>,
+    Json(request): Json<BrotherWirelessPrepareRequest>,
+) -> Result<Response, ApiError> {
+    let grant_id = authorize_admin(&state, &headers).await?;
+    require_brother_wifi_configuration(&state)?;
+    let request_origin = origin(&headers)?;
+    let (_, selector) =
+        brother_usb_connection_async(&state, &connection, BrotherReadOperation::Wireless).await?;
+    let settings = request.settings.validate()?;
+    let fingerprint = wireless_settings_fingerprint(&settings);
+    let approval = state
+        .auth
+        .write()
+        .await
+        .prepare_wifi_approval(grant_id, request_origin, &connection, &fingerprint)
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "approval persistence failed",
+            )
+        })?
+        .ok_or(ApiError(
+            StatusCode::UNAUTHORIZED,
+            "administrator grant required",
+        ))?;
+    Ok(no_store_json(BrotherWirelessPrepareResponse {
+        approval_id: approval.id,
+        expires_at: approval.expires_at,
+        connection,
+        device: selector,
+        ssid: settings.ssid,
+        encryption: settings.encryption,
+        authentication: settings.authentication,
+        infrastructure: settings.infrastructure,
+        wireless_direct: settings.wireless_direct,
+        reboot: settings.reboot,
+        recovery: "Keep the printer connected over USB or Bluetooth while changing wireless settings.",
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct BrotherWirelessConfigureRequest {
+    approval_id: Uuid,
+    #[serde(flatten)]
+    settings: BrotherWirelessSettingsRequest,
+}
+
+#[cfg(any(feature = "usb", test))]
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrotherWirelessConfigureResponse {
+    connection: String,
+    device: String,
+    applied: bool,
+    reboot: bool,
+}
+
+/// Applies an exact, locally approved mutation once. The one-time approval
+/// binds the originating administrator grant, browser origin, USB connection,
+/// and a hash of all settings including the password.
+async fn brother_wireless_configure(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(connection): AxumPath<String>,
+    Json(request): Json<BrotherWirelessConfigureRequest>,
+) -> Result<Response, ApiError> {
+    let grant_id = authorize_admin(&state, &headers).await?;
+    require_brother_wifi_configuration(&state)?;
+    let request_origin = origin(&headers)?;
+    let (_, selector) =
+        brother_usb_connection_async(&state, &connection, BrotherReadOperation::Wireless).await?;
+    let settings = request.settings.validate()?;
+    let fingerprint = wireless_settings_fingerprint(&settings);
+    let mut auth = state.auth.write().await;
+    // Local approval is recorded by a separate CLI process. Reload the full
+    // store before checking the admin grant and consuming the one-time
+    // approval, so the approval cannot be missed or replayed from stale RAM.
+    auth.reload().map_err(|_| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "approval persistence failed",
+        )
+    })?;
+    let approved = auth
+        .consume_wifi_approval(
+            request.approval_id,
+            grant_id,
+            request_origin,
+            &connection,
+            &fingerprint,
+        )
+        .map_err(|_| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "approval persistence failed",
+            )
+        })?;
+    if !approved {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "local wireless approval is missing, expired, or already used",
+        ));
+    }
+    #[cfg(test)]
+    if state
+        .injected_wireless_configurations
+        .read()
+        .await
+        .contains(&(connection.clone(), fingerprint))
+    {
+        return Ok(no_store_json(BrotherWirelessConfigureResponse {
+            connection,
+            device: selector,
+            applied: true,
+            reboot: settings.reboot,
+        }));
+    }
+    #[cfg(feature = "usb")]
+    {
+        let reboot = settings.reboot;
+        let configure_selector = selector.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::printer_ops::usb_wireless_configure(&configure_selector, &settings)
+        })
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::BAD_GATEWAY,
+                "wireless configuration task crashed",
+            )
+        })?
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "wireless configuration failed"))?;
+        Ok(no_store_json(BrotherWirelessConfigureResponse {
+            connection,
+            device: selector,
+            applied: true,
+            reboot,
+        }))
+    }
+    #[cfg(not(feature = "usb"))]
+    {
+        let _ = (selector, settings);
+        Err(ApiError(
+            StatusCode::NOT_IMPLEMENTED,
+            "USB support is unavailable in this build",
+        ))
+    }
+}
+
+/// Wi-Fi credentials are a state-changing operation. The API stays present so
+/// clients can keep a stable contract, but it is unavailable until the local
+/// operator explicitly opts in through the service configuration.
+fn require_brother_wifi_configuration(state: &ApiState) -> Result<(), ApiError> {
+    if state.config.enable_brother_wifi_configuration {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "Brother Wi-Fi configuration is disabled; set enable_brother_wifi_configuration to true locally",
+        ))
+    }
+}
+
+fn require_brother_wifi_configuration_pairing(state: &ApiState) -> Result<(), ApiError> {
+    if state.config.enable_brother_wifi_configuration_pairing {
+        Ok(())
+    } else {
+        Err(ApiError(
+            StatusCode::FORBIDDEN,
+            "Brother Wi-Fi administrator pairing is disabled; set enable_brother_wifi_configuration_pairing to true locally",
+        ))
+    }
+}
+
+async fn brother_system_report(
+    State(state): State<ApiState>,
+    headers: HeaderMap,
+    AxumPath(connection): AxumPath<String>,
+) -> Result<Response, ApiError> {
+    authorize(&state, &headers).await?;
+    let (_, selector) =
+        brother_usb_connection_async(&state, &connection, BrotherReadOperation::Report).await?;
+    #[cfg(test)]
+    if let Some(report) = state
+        .injected_system_reports
+        .read()
+        .await
+        .get(&connection)
+        .cloned()
+    {
+        return Ok(no_store_json(report.redacted()));
+    }
+    #[cfg(feature = "usb")]
+    {
+        let report = tokio::task::spawn_blocking(move || {
+            crate::printer_ops::usb_system_report(Some(&selector), true)
+        })
+        .await
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "system report task crashed"))?
+        .map_err(|_| ApiError(StatusCode::BAD_GATEWAY, "system report failed"))?;
+        Ok(no_store_json(report))
+    }
+    #[cfg(not(feature = "usb"))]
+    {
+        let _ = selector;
+        Err(ApiError(
+            StatusCode::NOT_IMPLEMENTED,
+            "USB support is unavailable in this build",
+        ))
+    }
+}
+
+async fn brother_usb_connection_async(
+    state: &ApiState,
+    connection: &str,
+    operation: BrotherReadOperation,
+) -> Result<(Connection, String), ApiError> {
+    let connections = state.connections.read().await;
+    let connection = connections.get(connection).cloned().ok_or(ApiError(
+        StatusCode::NOT_FOUND,
+        "printer connection not found",
+    ))?;
+    drop(connections);
+    let supported = match operation {
+        BrotherReadOperation::Wireless => {
+            matches!(connection.model.as_str(), "ql-1110nwb" | "ql-1115nwb")
+        }
+        BrotherReadOperation::Report => matches!(
+            connection.model.as_str(),
+            "ql-1100" | "ql-1110nwb" | "ql-1115nwb"
+        ),
+    };
+    if !supported {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "operation is unsupported for this printer model",
+        ));
+    }
+    if connection.transport["kind"] != "usb" {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Brother administration requires a USB connection",
+        ));
+    }
+    let selector = connection.transport["device"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .ok_or(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "stable USB device selector is required",
+        ))?
+        .to_owned();
+    Ok((connection, selector))
 }
 fn canonical_document(value: &serde_json::Value) -> Result<Document, ApiError> {
     if value
@@ -1225,6 +1942,7 @@ pub fn router(state: ApiState) -> Router {
         .allow_private_network(true);
     Router::new()
         .route("/v1/pair", post(pair))
+        .route("/v1/admin/pair", post(pair_admin))
         .route("/v1/grants/me", get(current_grant))
         .route("/v1/grants/me/rotate", post(rotate_current_grant))
         .route("/v1/grants/me/revoke", post(revoke_current_grant))
@@ -1233,6 +1951,26 @@ pub fn router(state: ApiState) -> Router {
         .route("/v1/discovery", post(discovery))
         .route("/v1/connection", post(connection))
         .route("/v1/status", get(status))
+        .route(
+            "/v1/printers/{connection}/brother/wifi/status",
+            get(brother_wireless_status),
+        )
+        .route(
+            "/v1/printers/{connection}/brother/wifi/scan",
+            post(brother_wireless_scan),
+        )
+        .route(
+            "/v1/printers/{connection}/brother/wifi/prepare",
+            post(brother_wireless_prepare),
+        )
+        .route(
+            "/v1/printers/{connection}/brother/wifi/configure",
+            post(brother_wireless_configure),
+        )
+        .route(
+            "/v1/printers/{connection}/brother/report",
+            get(brother_system_report),
+        )
         .route("/v1/documents/validate", post(validate_document))
         .route("/v1/documents/preview", post(preview_document))
         .route("/v1/documents/export", post(export_document))
@@ -1292,6 +2030,120 @@ mod tests {
     use axum::body::Body;
     use http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    fn test_connection(model: &str, kind: &str) -> Connection {
+        Connection {
+            id: "test".into(),
+            model: model.into(),
+            transport: serde_json::json!({"kind": kind}),
+            status: "ready".into(),
+            media: None,
+        }
+    }
+
+    #[test]
+    fn brother_operations_are_derived_only_for_supported_usb_models() {
+        let ql_1110 = connection_operations(&test_connection("ql-1110nwb", "usb"), true);
+        assert_eq!(
+            ql_1110,
+            [
+                "print",
+                "status",
+                "system-report",
+                "wifi-configure",
+                "wifi-scan",
+                "wifi-status"
+            ]
+        );
+
+        assert_eq!(
+            connection_operations(&test_connection("ql-1115nwb", "usb"), true),
+            ql_1110
+        );
+
+        assert_eq!(
+            connection_operations(&test_connection("ql-1100", "usb"), true),
+            ["print", "status", "system-report"]
+        );
+        assert_eq!(
+            connection_operations(&test_connection("ql-1115nwb", "ipp"), true),
+            ["print", "status"]
+        );
+        assert_eq!(
+            connection_operations(&test_connection("ql-1115nwb", "ble"), true),
+            ["print", "status"]
+        );
+    }
+
+    #[test]
+    fn wifi_configuration_is_hidden_without_the_local_opt_in() {
+        assert_eq!(
+            connection_operations(&test_connection("ql-1110nwb", "usb"), false),
+            [
+                "print",
+                "status",
+                "system-report",
+                "wifi-scan",
+                "wifi-status"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn wifi_configuration_routes_are_forbidden_without_the_local_opt_in() {
+        let mut state = test_state();
+        state.config.enable_brother_wifi_configuration = false;
+        let token = test_admin_token(&state).await;
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/printers/any/brother/wifi/prepare")
+                    .header("host", "localhost:9847")
+                    .header("origin", "https://editor.example")
+                    .header("authorization", format!("Bearer {token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"ssid":"test","password":"not-returned","encryption":"aes","authentication":"wpa2-only"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
+    async fn administrator_pairing_is_forbidden_without_its_separate_local_opt_in() {
+        let mut state = test_state();
+        state.config.enable_brother_wifi_configuration = true;
+        state.config.enable_brother_wifi_configuration_pairing = false;
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/admin/pair")
+                    .header("host", "localhost:9847")
+                    .header("origin", "https://editor.example")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"secret":"not-used"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[test]
+    fn operation_metadata_is_not_persisted_with_connection() {
+        let connection = test_connection("ql-1110nwb", "usb");
+        let stored = serde_json::to_value(&connection).unwrap();
+        assert!(stored.get("operations").is_none());
+        assert!(
+            connection_json(&connection, true)
+                .get("operations")
+                .is_some()
+        );
+    }
+
     #[test]
     fn local_job_trace_fields_are_an_explicit_safe_allowlist() {
         tracing::subscriber::with_default(tracing_subscriber::registry(), || {
@@ -1331,9 +2183,11 @@ mod tests {
                     "https://editor.example".into(),
                     "https://labels.dev1.makersbrain.net".into(),
                 ],
+                enable_brother_wifi_configuration: true,
                 connections_path: Some(dir.join("connections.json")),
                 catalogue_path: Some(dir.join("catalogues.json")),
                 jobs_path: Some(dir.join("jobs.json")),
+                enable_brother_wifi_configuration_pairing: true,
                 ..Config::default()
             },
         )
@@ -1351,6 +2205,17 @@ mod tests {
             .write()
             .await
             .exchange(&secret, "https://editor.example", Duration::from_secs(300))
+            .unwrap()
+            .unwrap()
+            .1
+    }
+
+    async fn test_admin_token(state: &ApiState) -> String {
+        state
+            .auth
+            .write()
+            .await
+            .issue_admin("https://editor.example", Duration::from_secs(30))
             .unwrap()
             .unwrap()
             .1
@@ -1609,6 +2474,341 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authenticated_printer_state_responses_are_not_cached() {
+        let state = test_state();
+        let token = test_token(&state).await;
+        let app = router(state);
+        for (method, path) in [
+            (http::Method::GET, "/v1/printers"),
+            (http::Method::POST, "/v1/discovery"),
+            (http::Method::GET, "/v1/status"),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "localhost:9847")
+                .header("origin", "https://editor.example")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.headers().get(header::CACHE_CONTROL),
+                Some(&HeaderValue::from_static("no-store")),
+                "{path}"
+            );
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/json")),
+                "{path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn brother_read_routes_are_typed_redacted_authenticated_and_not_cached() {
+        use http_body_util::BodyExt as _;
+        use mb_printer_core::protocol::brother::wifi::{
+            AccessPoint, WirelessAuthentication, WirelessEncryption,
+        };
+
+        let state = test_state();
+        state.connections.write().await.insert(
+            "brother-usb".into(),
+            Connection {
+                id: "brother-usb".into(),
+                model: "ql-1110nwb".into(),
+                transport: serde_json::json!({
+                    "kind":"usb",
+                    "device":"usb-device:04f9:209b:001:007"
+                }),
+                status: "ready".into(),
+                media: None,
+            },
+        );
+        let report = crate::printer_ops::parse_system_report(
+            b"<<PRINTER CONFIGURATION>>\n[WLAN]\nSSID=Cafe\nChannel=6\n",
+            false,
+        )
+        .unwrap();
+        state
+            .inject_brother_reads(
+                "brother-usb",
+                crate::printer_ops::WirelessStatus {
+                    connected: Some(true),
+                    ip_address: Some("192.168.1.100".into()),
+                    ssid: Some("Cafe".into()),
+                    encryption: Some(WirelessEncryption::TkipAes),
+                    authentication: Some(WirelessAuthentication::WpaPsk),
+                    infrastructure: Some(true),
+                    wireless_direct: Some(false),
+                },
+                vec![AccessPoint {
+                    ssid: "Cafe".into(),
+                    channel: 6,
+                    power: -42,
+                    enterprise: false,
+                    encrypted: true,
+                }],
+                report,
+            )
+            .await;
+        let token = test_token(&state).await;
+        let app = router(state);
+        let preflight = Request::options("/v1/printers/brother-usb/brother/wifi/scan")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("access-control-request-method", "POST")
+            .header("access-control-request-headers", "authorization")
+            .header("access-control-request-private-network", "true")
+            .body(Body::empty())
+            .unwrap();
+        let preflight = app.clone().oneshot(preflight).await.unwrap();
+        assert_eq!(preflight.status(), StatusCode::OK);
+        assert_eq!(
+            preflight.headers()["access-control-allow-private-network"],
+            "true"
+        );
+        for (method, path, expected_pointer) in [
+            (
+                http::Method::GET,
+                "/v1/printers/brother-usb/brother/wifi/status",
+                "/connected",
+            ),
+            (
+                http::Method::POST,
+                "/v1/printers/brother-usb/brother/wifi/scan",
+                "/accessPoints/0/channel",
+            ),
+            (
+                http::Method::GET,
+                "/v1/printers/brother-usb/brother/report",
+                "/sections/WLAN/SSID",
+            ),
+        ] {
+            let request = Request::builder()
+                .method(method)
+                .uri(path)
+                .header("host", "localhost:9847")
+                .header("origin", "https://editor.example")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+            let body: serde_json::Value =
+                serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            assert!(body.pointer(expected_pointer).is_some(), "{path}: {body}");
+            if path.ends_with("/report") {
+                assert_eq!(body.pointer(expected_pointer).unwrap(), "[REDACTED]");
+                assert!(!body.to_string().contains("Cafe"));
+            }
+        }
+
+        let unauthenticated = Request::get("/v1/printers/brother-usb/brother/wifi/status")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(unauthenticated).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn brother_read_routes_reject_wrong_model_transport_and_missing_selector() {
+        let state = test_state();
+        for (id, model, transport) in [
+            (
+                "wrong-model",
+                "m110",
+                serde_json::json!({"kind":"usb","device":"serial"}),
+            ),
+            (
+                "non-wifi-brother",
+                "ql-1100",
+                serde_json::json!({"kind":"usb","device":"serial"}),
+            ),
+            (
+                "wrong-transport",
+                "ql-1110nwb",
+                serde_json::json!({"kind":"ipp","uri":"ipp://printer.local/ipp/print"}),
+            ),
+            (
+                "missing-selector",
+                "ql-1110nwb",
+                serde_json::json!({"kind":"usb"}),
+            ),
+        ] {
+            state.connections.write().await.insert(
+                id.into(),
+                Connection {
+                    id: id.into(),
+                    model: model.into(),
+                    transport,
+                    status: "ready".into(),
+                    media: None,
+                },
+            );
+        }
+        let token = test_token(&state).await;
+        let app = router(state);
+        for id in [
+            "wrong-model",
+            "non-wifi-brother",
+            "wrong-transport",
+            "missing-selector",
+        ] {
+            let request = Request::get(format!("/v1/printers/{id}/brother/wifi/status"))
+                .header("host", "localhost:9847")
+                .header("origin", "https://editor.example")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{id}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn brother_wireless_prepare_requires_admin_and_never_echoes_a_password() {
+        use http_body_util::BodyExt as _;
+
+        let state = test_state();
+        state.connections.write().await.insert(
+            "brother-usb".into(),
+            Connection {
+                id: "brother-usb".into(),
+                model: "ql-1110nwb".into(),
+                transport: serde_json::json!({
+                    "kind":"usb",
+                    "device":"usb-device:04f9:209b:001:007"
+                }),
+                status: "ready".into(),
+                media: None,
+            },
+        );
+        let print_token = test_token(&state).await;
+        let admin_token = test_admin_token(&state).await;
+        let app = router(state.clone());
+        let body = serde_json::json!({
+            "ssid":"Office WiFi",
+            "password":"test-secret-never-returned",
+            "encryption":"tkip-aes",
+            "authentication":"wpa-psk",
+            "infrastructure":true,
+            "wirelessDirect":false,
+            "reboot":true
+        })
+        .to_string();
+
+        let request = |token: &str| {
+            Request::post("/v1/printers/brother-usb/brother/wifi/prepare")
+                .header("host", "localhost:9847")
+                .header("origin", "https://editor.example")
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/json")
+                .body(Body::from(body.clone()))
+                .unwrap()
+        };
+        let rejected = app.clone().oneshot(request(&print_token)).await.unwrap();
+        assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(rejected.headers()[header::CACHE_CONTROL], "no-store");
+
+        let response = app.clone().oneshot(request(&admin_token)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let text = String::from_utf8(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(text.contains("Office WiFi"));
+        assert!(!text.contains("test-secret-never-returned"));
+        assert!(text.contains("USB or Bluetooth"));
+
+        let approval_id = serde_json::from_str::<serde_json::Value>(&text).unwrap()["approvalId"]
+            .as_str()
+            .unwrap()
+            .parse::<Uuid>()
+            .unwrap();
+        let settings = mb_printer_core::protocol::brother::wifi::WirelessSettings {
+            ssid: "Office WiFi".into(),
+            password: "test-secret-never-returned".into(),
+            encryption: mb_printer_core::protocol::brother::wifi::WirelessEncryption::TkipAes,
+            authentication:
+                mb_printer_core::protocol::brother::wifi::WirelessAuthentication::WpaPsk,
+            infrastructure: true,
+            wireless_direct: false,
+            reboot: true,
+        };
+        state
+            .inject_brother_wireless_configuration("brother-usb", &settings)
+            .await;
+        assert!(
+            state
+                .auth
+                .write()
+                .await
+                .approve_wifi_approval(approval_id)
+                .unwrap()
+        );
+        let configure_body = serde_json::json!({
+            "approvalId":approval_id,
+            "ssid":"Office WiFi",
+            "password":"test-secret-never-returned",
+            "encryption":"tkip-aes",
+            "authentication":"wpa-psk",
+            "infrastructure":true,
+            "wirelessDirect":false,
+            "reboot":true
+        })
+        .to_string();
+        let configured = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/printers/brother-usb/brother/wifi/configure")
+                    .header("host", "localhost:9847")
+                    .header("origin", "https://editor.example")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(configure_body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(configured.status(), StatusCode::OK);
+        assert_eq!(configured.headers()[header::CACHE_CONTROL], "no-store");
+        // A consumed approval cannot replay the same password-bearing request.
+        let replay = app
+            .oneshot(
+                Request::post("/v1/printers/brother-usb/brother/wifi/configure")
+                    .header("host", "localhost:9847")
+                    .header("origin", "https://editor.example")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(configure_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        assert_eq!(replay.headers()[header::CACHE_CONTROL], "no-store");
+    }
+
+    #[tokio::test]
     async fn cors_and_private_network_preflight_are_origin_scoped() {
         let app = router(test_state());
         let allowed = Request::options("/v1/jobs")
@@ -1782,6 +2982,8 @@ mod tests {
                 product_id: None,
                 serial_number: None,
                 ieee1284_device_id: None,
+                #[cfg(feature = "network")]
+                network: None,
             }])
             .await;
         let app = router(state.clone());
@@ -2015,6 +3217,242 @@ mod tests {
             app.oneshot(revoke).await.unwrap().status(),
             StatusCode::NO_CONTENT
         );
+    }
+
+    #[tokio::test]
+    async fn administrator_pairing_is_distinct_short_lived_and_not_cacheable() {
+        let state = test_state();
+        let secret = state
+            .auth
+            .write()
+            .await
+            .begin_admin_pairing(Duration::from_secs(30))
+            .unwrap()
+            .value;
+        let app = router(state.clone());
+
+        // A scoped admin secret must not be accepted by the normal pairing
+        // endpoint, and that failed attempt must not consume it.
+        let normal_pair = Request::post("/v1/pair")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"secret":"{secret}"}}"#)))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(normal_pair).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let administrator_pair = Request::post("/v1/admin/pair")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"secret":"{secret}"}}"#)))
+            .unwrap();
+        let response = app.clone().oneshot(administrator_pair).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        use http_body_util::BodyExt;
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        let pair = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+        let token = pair["token"].as_str().unwrap();
+        assert!(
+            state
+                .auth
+                .read()
+                .await
+                .authenticate_admin(token, "https://editor.example")
+                .is_some()
+        );
+        let grant = state.auth.read().await.grants().pop().unwrap();
+        assert_eq!(grant.scope, crate::auth::GrantScope::Admin);
+        assert!(grant.expires_at <= grant.created_at + 600);
+
+        // The secret is one-time even when its intended endpoint was used.
+        let replay = Request::post("/v1/admin/pair")
+            .header("host", "localhost:9847")
+            .header("origin", "https://editor.example")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"secret":"{secret}"}}"#)))
+            .unwrap();
+        assert_eq!(
+            app.oneshot(replay).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn normal_pairing_created_by_a_separate_cli_process_is_visible_to_running_service() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state_at(directory.path());
+        let app = router(state.clone());
+
+        // This deliberately does not use `state.auth`: it emulates `mb-printer
+        // api pair` loading and changing the durable store after the service
+        // process has already constructed its ApiState.
+        let mut cli_store = AuthStore::load(directory.path().join("g.json")).unwrap();
+        let secret = cli_store
+            .begin_pairing(Duration::from_secs(30))
+            .unwrap()
+            .value;
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/pair")
+                    .header("host", "localhost:9847")
+                    .header("origin", "https://editor.example")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"secret":"{secret}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        use http_body_util::BodyExt as _;
+        let pair: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            state
+                .auth
+                .read()
+                .await
+                .authenticate(pair["token"].as_str().unwrap(), "https://editor.example")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn administrator_pairing_created_by_a_separate_cli_process_is_visible_to_running_service()
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state_at(directory.path());
+        let app = router(state.clone());
+        let mut cli_store = AuthStore::load(directory.path().join("g.json")).unwrap();
+        let secret = cli_store
+            .begin_admin_pairing(Duration::from_secs(30))
+            .unwrap()
+            .value;
+
+        let response = app
+            .oneshot(
+                Request::post("/v1/admin/pair")
+                    .header("host", "localhost:9847")
+                    .header("origin", "https://editor.example")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(r#"{{"secret":"{secret}"}}"#)))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        use http_body_util::BodyExt as _;
+        let pair: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            state
+                .auth
+                .read()
+                .await
+                .authenticate_admin(pair["token"].as_str().unwrap(), "https://editor.example")
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn wifi_approval_created_by_a_separate_cli_process_is_consumed_by_running_service() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = test_state_at(directory.path());
+        state.connections.write().await.insert(
+            "brother-usb".into(),
+            Connection {
+                id: "brother-usb".into(),
+                model: "ql-1110nwb".into(),
+                transport: serde_json::json!({
+                    "kind":"usb",
+                    "device":"usb-device:04f9:209b:001:007"
+                }),
+                status: "ready".into(),
+                media: None,
+            },
+        );
+        let admin_token = test_admin_token(&state).await;
+        let app = router(state.clone());
+        let body = serde_json::json!({
+            "ssid":"Office WiFi",
+            "password":"test-secret-never-returned",
+            "encryption":"tkip-aes",
+            "authentication":"wpa-psk",
+            "infrastructure":true,
+            "wirelessDirect":false,
+            "reboot":true
+        })
+        .to_string();
+        let prepared = app
+            .clone()
+            .oneshot(
+                Request::post("/v1/printers/brother-usb/brother/wifi/prepare")
+                    .header("host", "localhost:9847")
+                    .header("origin", "https://editor.example")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.clone()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prepared.status(), StatusCode::OK);
+        use http_body_util::BodyExt as _;
+        let approval: serde_json::Value =
+            serde_json::from_slice(&prepared.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let approval_id: Uuid = approval["approvalId"].as_str().unwrap().parse().unwrap();
+
+        // Emulate `mb-printer api approve-wifi`: it must not share the API
+        // process's in-memory AuthStore.
+        let mut cli_store = AuthStore::load(directory.path().join("g.json")).unwrap();
+        assert!(cli_store.approve_wifi_approval(approval_id).unwrap());
+
+        let settings = mb_printer_core::protocol::brother::wifi::WirelessSettings {
+            ssid: "Office WiFi".into(),
+            password: "test-secret-never-returned".into(),
+            encryption: mb_printer_core::protocol::brother::wifi::WirelessEncryption::TkipAes,
+            authentication:
+                mb_printer_core::protocol::brother::wifi::WirelessAuthentication::WpaPsk,
+            infrastructure: true,
+            wireless_direct: false,
+            reboot: true,
+        };
+        state
+            .inject_brother_wireless_configuration("brother-usb", &settings)
+            .await;
+        let configured = app
+            .oneshot(
+                Request::post("/v1/printers/brother-usb/brother/wifi/configure")
+                    .header("host", "localhost:9847")
+                    .header("origin", "https://editor.example")
+                    .header("authorization", format!("Bearer {admin_token}"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "approvalId":approval_id,
+                            "ssid":"Office WiFi",
+                            "password":"test-secret-never-returned",
+                            "encryption":"tkip-aes",
+                            "authentication":"wpa-psk",
+                            "infrastructure":true,
+                            "wirelessDirect":false,
+                            "reboot":true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(configured.status(), StatusCode::OK);
     }
     #[test]
     fn cancellation_at_first_write_uses_conservative_ambiguous_outcome() {

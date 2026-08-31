@@ -24,9 +24,10 @@ working tree:
 scripts/build_release_candidate.sh /tmp/mb-printer-cli-0.1.0
 ```
 
-Linux feature-complete candidates require `pkg-config` and D-Bus development
-headers. The same platform prerequisites documented for Bluetooth installation
-must be available before running the script.
+Linux feature-complete candidates use `bluetooth-linux`, which vendors D-Bus;
+runtime hardware acceptance still requires BlueZ and adapter permission. A
+Linux build using only the portable `bluetooth` feature instead needs
+`pkg-config` and D-Bus development headers.
 
 The committed `.github/sdk-ref` is the single SDK source revision used by CI,
 tagged releases, and local release candidates. The pin must be a full commit on
@@ -35,8 +36,8 @@ merged. The sheet-export migration must not land until this pin is advanced to t
 merged SDK commit that provides `mb_printer_core::sheet`; a local uncommitted SDK
 worktree is never a valid substitute for that pin.
 
-The candidate script uses locked dependencies and the feature-complete local
-profile (`usb,bluetooth` by default), installs pinned `cargo-cyclonedx` 0.5.7
+The candidate script uses locked dependencies and the portable full local
+profile (`brother-admin,bluetooth` by default), installs pinned `cargo-cyclonedx` 0.5.7
 in an isolated temporary tool root when needed, and emits:
 
 - the host binary and its individual SHA-256 file;
@@ -51,7 +52,8 @@ installed binary's `--version`. Any dirty CLI worktree, invalid SDK pin, build,
 checksum, SBOM, archive, installation, or version failure stops the candidate
 build. Set
 `MB_PRINTER_RELEASE_FEATURES` only when deliberately producing a documented
-platform-specific feature variant.
+platform-specific feature variant. Linux candidates that include RFCOMM use
+`MB_PRINTER_RELEASE_FEATURES=brother-admin,bluetooth-linux`.
 
 Inspect every file and verify `sha256sum -c SHA256SUMS` before signing a tag.
 Push the SDK and wait for its release and registry publication before pushing
