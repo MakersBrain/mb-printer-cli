@@ -90,7 +90,11 @@ pub struct NetworkDiscoveryArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum UsbCommand {
-    List,
+    List {
+        /// Include devices that do not expose a USB Printer Class interface.
+        #[arg(long)]
+        all: bool,
+    },
     Info {
         address: String,
     },
@@ -498,6 +502,27 @@ mod tests {
             Cli::try_parse_from(["mb-printer", "network", "status", "--timeout-ms", "10001"])
                 .is_err()
         );
+    }
+
+    #[test]
+    fn usb_list_all_is_opt_in() {
+        let cli = Cli::try_parse_from(["mb-printer", "usb", "list"]).unwrap();
+        let Command::Usb {
+            command: UsbCommand::List { all },
+        } = cli.command
+        else {
+            panic!()
+        };
+        assert!(!all);
+
+        let cli = Cli::try_parse_from(["mb-printer", "usb", "list", "--all"]).unwrap();
+        let Command::Usb {
+            command: UsbCommand::List { all },
+        } = cli.command
+        else {
+            panic!()
+        };
+        assert!(all);
     }
 
     #[test]

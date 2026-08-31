@@ -233,49 +233,62 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("network discovery requires the network Cargo feature".into());
             }
         }
-        Command::Usb { command } => {
-            let devices = transport::discover_native()?
-                .into_iter()
-                .filter(|device| device.transport == "usb")
-                .collect::<Vec<_>>();
-            match command {
-                UsbCommand::List => println!("{}", serde_json::to_string_pretty(&devices)?),
-                UsbCommand::Info { address } => println!(
+        Command::Usb { command } => match command {
+            UsbCommand::List { all } => {
+                #[cfg(feature = "usb")]
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&transport::usb::discover(all)?)?
+                );
+                #[cfg(not(feature = "usb"))]
+                {
+                    let _ = all;
+                    return Err("USB discovery requires the usb Cargo feature".into());
+                }
+            }
+            UsbCommand::Info { address } => {
+                #[cfg(feature = "usb")]
+                println!(
                     "{}",
                     serde_json::to_string_pretty(
-                        &devices
+                        &transport::usb::discover(true)?
                             .into_iter()
                             .find(|device| device.address == address)
                             .ok_or("USB device not found")?
                     )?
-                ),
-                UsbCommand::Report {
-                    selector,
-                    output,
-                    format,
-                    unsafe_unredacted,
-                } => {
-                    #[cfg(feature = "usb")]
-                    {
-                        let report = printer_ops::usb_system_report(
-                            selector.device.as_deref(),
-                            !unsafe_unredacted,
-                        )?;
-                        let bytes = match format {
-                            ReportFormat::Json => serde_json::to_vec_pretty(&report)?,
-                            ReportFormat::Text => report.text.into_bytes(),
-                        };
-                        write_owner_only(&output, &bytes)?;
-                        println!("{}", output.display());
-                    }
-                    #[cfg(not(feature = "usb"))]
-                    {
-                        let _ = (selector, output, format, unsafe_unredacted);
-                        return Err("Brother reports require the usb Cargo feature".into());
-                    }
+                );
+                #[cfg(not(feature = "usb"))]
+                {
+                    let _ = address;
+                    return Err("USB discovery requires the usb Cargo feature".into());
                 }
             }
-        }
+            UsbCommand::Report {
+                selector,
+                output,
+                format,
+                unsafe_unredacted,
+            } => {
+                #[cfg(feature = "usb")]
+                {
+                    let report = printer_ops::usb_system_report(
+                        selector.device.as_deref(),
+                        !unsafe_unredacted,
+                    )?;
+                    let bytes = match format {
+                        ReportFormat::Json => serde_json::to_vec_pretty(&report)?,
+                        ReportFormat::Text => report.text.into_bytes(),
+                    };
+                    write_owner_only(&output, &bytes)?;
+                    println!("{}", output.display());
+                }
+                #[cfg(not(feature = "usb"))]
+                {
+                    let _ = (selector, output, format, unsafe_unredacted);
+                    return Err("Brother reports require the usb Cargo feature".into());
+                }
+            }
+        },
         Command::Wifi { command } => match command {
             WifiCommand::Scan { input, selector } => {
                 if let Some(input) = input {
