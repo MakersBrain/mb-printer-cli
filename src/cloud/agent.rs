@@ -55,6 +55,10 @@ fn status(job: &Job) -> wire::JobStatus {
             .map(safe_error_code)
             .unwrap_or_default(),
         action_count: job.action_count as u64,
+        item: job.batch_item as u64,
+        items: job.batch_items as u64,
+        copy: u32::from(job.batch_copy),
+        copies: u32::from(job.batch_copies),
     }
 }
 

@@ -25,6 +25,14 @@ pub struct Job {
     pub potentially_accepted_write: bool,
     pub protocol: Option<String>,
     pub action_count: usize,
+    #[serde(default)]
+    pub batch_item: usize,
+    #[serde(default = "one")]
+    pub batch_items: usize,
+    #[serde(default)]
+    pub batch_copy: u16,
+    #[serde(default = "one_u16")]
+    pub batch_copies: u16,
     pub error: Option<String>,
     #[serde(default)]
     pub resumable: Option<serde_json::Value>,
@@ -55,6 +63,10 @@ impl Job {
             potentially_accepted_write: false,
             protocol: None,
             action_count: 0,
+            batch_item: 0,
+            batch_items: 1,
+            batch_copy: 0,
+            batch_copies: 1,
             error: None,
             resumable: None,
             idempotency_key: None,
@@ -91,6 +103,12 @@ impl Job {
                 | JobState::Failed
         )
     }
+}
+const fn one() -> usize {
+    1
+}
+const fn one_u16() -> u16 {
+    1
 }
 
 impl Default for Job {
