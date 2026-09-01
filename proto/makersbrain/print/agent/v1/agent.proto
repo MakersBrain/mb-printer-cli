@@ -90,4 +90,8 @@ message JobStatus {
   bool potentially_accepted_write = 7;
   string error_code = 8;
   uint64 action_count = 9;
+  uint64 item = 10;
+  uint64 items = 11;
+  uint32 copy = 12;
+  uint32 copies = 13;
 }

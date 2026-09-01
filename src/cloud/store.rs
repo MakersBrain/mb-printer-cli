@@ -12,7 +12,10 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct CloudPrintRequest {
-    pub document: serde_json::Value,
+    #[serde(default)]
+    pub document: Option<serde_json::Value>,
+    #[serde(default)]
+    pub documents: Vec<serde_json::Value>,
     pub model: String,
     #[serde(default)]
     pub dpi: Option<u16>,
@@ -26,6 +29,25 @@ pub struct CloudPrintRequest {
     pub copies: u16,
     #[serde(default = "default_payload_limit")]
     pub payload_limit: usize,
+    #[serde(default)]
+    pub continuous: Option<ContinuousPrintOptions>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ContinuousPrintOptions {
+    pub cut_mode: ContinuousCutMode,
+    pub extra_feed_before_mm: f64,
+    pub extra_feed_after_mm: f64,
+    pub chain_copies: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum ContinuousCutMode {
+    AfterEach,
+    AfterJob,
+    None,
 }
 
 const fn default_density() -> u8 {
@@ -120,7 +142,8 @@ impl CloudJobStore {
         }
         let request: CloudPrintRequest =
             serde_json::from_slice(bytes).map_err(|_| ReceiveError::InvalidRequest)?;
-        if request.model.is_empty()
+        if request.document.is_some() == !request.documents.is_empty()
+            || request.model.is_empty()
             || request.copies == 0
             || !(1..=8).contains(&request.density)
             || request.payload_limit == 0
@@ -182,13 +205,15 @@ mod tests {
 
     fn request() -> Vec<u8> {
         serde_json::to_vec(&CloudPrintRequest {
-            document: serde_json::json!({"version":4}),
+            document: Some(serde_json::json!({"version":4})),
+            documents: Vec::new(),
             model: "m110".into(),
             dpi: None,
             rotation: 0,
             fit: false,
             density: 6,
             copies: 1,
+            continuous: None,
             payload_limit: 512,
         })
         .unwrap()

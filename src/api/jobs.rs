@@ -90,6 +90,10 @@ pub(super) struct JobView {
     actions: usize,
     total_bytes: u64,
     phase: String,
+    item: usize,
+    items: usize,
+    copy: u16,
+    copies: u16,
     error: Option<String>,
 }
 impl From<&Job> for JobView {
@@ -108,6 +112,10 @@ impl From<&Job> for JobView {
             actions: job.action_count,
             total_bytes: job.total_bytes,
             phase: format!("{:?}", job.state).to_ascii_lowercase(),
+            item: job.batch_item,
+            items: job.batch_items,
+            copy: job.batch_copy,
+            copies: job.batch_copies,
             error: job.error.clone(),
         }
     }
@@ -116,7 +124,10 @@ impl From<&Job> for JobView {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct JobRequest {
-    document: serde_json::Value,
+    #[serde(default)]
+    document: Option<serde_json::Value>,
+    #[serde(default)]
+    documents: Vec<serde_json::Value>,
     #[serde(alias = "printerId")]
     model: Option<String>,
     #[serde(default)]
@@ -135,6 +146,8 @@ struct JobRequest {
     payload_limit: usize,
     #[serde(default)]
     transport: Option<ApiTransport>,
+    #[serde(default)]
+    continuous: Option<crate::cloud::store::ContinuousPrintOptions>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
@@ -282,6 +295,88 @@ const fn default_copies() -> u16 {
 const fn default_payload() -> usize {
     512
 }
+fn continuous_protocol_options(
+    document: &Document,
+    printer: &capabilities::PrinterDefinition,
+    job: Option<&crate::cloud::store::ContinuousPrintOptions>,
+    copies: u16,
+) -> Result<(bool, u8), ApiError> {
+    if !document.media.continuous {
+        return if job.is_some() {
+            Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "continuous print options require continuous media",
+            ))
+        } else {
+            Ok((true, 1))
+        };
+    }
+    let capability = printer
+        .continuous_media
+        .as_ref()
+        .filter(|capability| capability.supported)
+        .ok_or(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "printer does not support qualified continuous-media jobs",
+        ))?;
+    let length = document.media.height as f64 / 1_000.0;
+    if length < capability.minimum_length_mm || length > capability.maximum_length_mm {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "continuous document length is outside the printer capability range",
+        ));
+    }
+    let Some(job) = job else {
+        return Ok((true, 1));
+    };
+    let cut_mode = match job.cut_mode {
+        crate::cloud::store::ContinuousCutMode::AfterEach => {
+            capabilities::ContinuousCutMode::AfterEach
+        }
+        crate::cloud::store::ContinuousCutMode::AfterJob => {
+            capabilities::ContinuousCutMode::AfterJob
+        }
+        crate::cloud::store::ContinuousCutMode::None => capabilities::ContinuousCutMode::None,
+    };
+    if !capability.cut_modes.contains(&cut_mode) {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "requested continuous cut mode is unsupported by this printer",
+        ));
+    }
+    if job.chain_copies && !capability.supports_chained_raster {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "printer does not support chained continuous rasters",
+        ));
+    }
+    for feed in [job.extra_feed_before_mm, job.extra_feed_after_mm] {
+        if !feed.is_finite()
+            || feed < capability.minimum_extra_feed_mm
+            || feed > capability.maximum_extra_feed_mm
+        {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "continuous extra feed is outside the printer capability range",
+            ));
+        }
+    }
+    Ok((
+        !matches!(cut_mode, capabilities::ContinuousCutMode::None),
+        if matches!(cut_mode, capabilities::ContinuousCutMode::AfterJob)
+            || (matches!(cut_mode, capabilities::ContinuousCutMode::AfterEach) && job.chain_copies)
+        {
+            u8::try_from(copies).map_err(|_| {
+                ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "copy count exceeds cut-every range",
+                )
+            })?
+        } else {
+            1
+        },
+    ))
+}
 pub(super) struct Cancellable<T> {
     pub(super) inner: T,
     pub(super) cancel: Arc<AtomicBool>,
@@ -332,8 +427,14 @@ pub(super) fn execute_cancellable<T: mb_printer_native::Transport>(
     plan: &mb_printer_core::protocol::Plan,
     inner: T,
     cancel: Arc<AtomicBool>,
+    progress_callback: &mut dyn FnMut(&mb_printer_native::Progress),
 ) -> Result<mb_printer_native::Progress, (String, Option<mb_printer_native::Progress>)> {
-    mb_printer_native::execute(plan, &mut Cancellable { inner, cancel }).map_err(|error| {
+    mb_printer_native::execute_with_progress(
+        plan,
+        &mut Cancellable { inner, cancel },
+        progress_callback,
+    )
+    .map_err(|error| {
         let progress = error_progress(&error).cloned();
         (error.to_string(), progress)
     })
@@ -345,6 +446,7 @@ fn execute_ipp_cancellable(
     certificate_pem: Option<String>,
     payload_limit: usize,
     cancel: Arc<AtomicBool>,
+    progress_callback: &mut dyn FnMut(&mb_printer_native::Progress),
 ) -> Result<mb_printer_native::Progress, (String, Option<mb_printer_native::Progress>)> {
     if plan.protocol != mb_printer_core::capabilities::Protocol::Brother {
         return Err((
@@ -373,7 +475,7 @@ fn execute_ipp_cancellable(
     let mut response = vec![0; 32];
     response[..3].copy_from_slice(&[0x80, 0x20, 0x42]);
     capture.response = Some(response);
-    let progress = mb_printer_native::execute(plan, &mut capture)
+    let progress = mb_printer_native::execute_with_progress(plan, &mut capture, progress_callback)
         .map_err(|error| (error.to_string(), None))?;
     let document = capture
         .events
@@ -574,17 +676,81 @@ impl JobExecutor {
                 "RFCOMM transport is unavailable in this build",
             ));
         }
-        let document = canonical_document(&request.document)?;
-        if document.validate().is_err() {
+        let document_values = match (&request.document, request.documents.is_empty()) {
+            (Some(document), true) => vec![document.clone()],
+            (None, false) => request.documents.clone(),
+            _ => {
+                return Err(ApiError(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "provide exactly one of document or documents",
+                ));
+            }
+        };
+        if document_values.len()
+            > usize::try_from(mb_printer_core::limits::WireLimits::default().max_request_documents)
+                .unwrap_or(usize::MAX)
+        {
+            return Err(ApiError(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "batch document count exceeds processing limit",
+            ));
+        }
+        let documents = document_values
+            .iter()
+            .map(canonical_document)
+            .collect::<Result<Vec<_>, _>>()?;
+        if documents
+            .iter()
+            .any(|document| document.validate().is_err())
+        {
             return Err(ApiError(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "document validation failed",
+            ));
+        }
+        let document = &documents[0];
+        if documents.iter().any(|item| {
+            item.media.continuous != document.media.continuous
+                || item.media.width != document.media.width
+                || item.media.dpi != document.media.dpi
+        }) {
+            return Err(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "batch documents must use the same roll width, DPI, and media mode",
             ));
         }
         let printer = capabilities::by_id(&model).ok_or(ApiError(
             StatusCode::UNPROCESSABLE_ENTITY,
             "unknown printer model",
         ))?;
+        let total_labels = usize::from(request.copies)
+            .checked_mul(documents.len())
+            .and_then(|value| u16::try_from(value).ok())
+            .ok_or(ApiError(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "batch label count exceeds range",
+            ))?;
+        let cut_counter_labels = request
+            .continuous
+            .as_ref()
+            .map_or(total_labels, |continuous| {
+                if continuous.chain_copies
+                    && matches!(
+                        continuous.cut_mode,
+                        crate::cloud::store::ContinuousCutMode::AfterEach
+                    )
+                {
+                    request.copies
+                } else {
+                    total_labels
+                }
+            });
+        let (cut, cut_every) = continuous_protocol_options(
+            document,
+            &printer,
+            request.continuous.as_ref(),
+            cut_counter_labels,
+        )?;
         tracing::Span::current().record("model", model.as_str());
         tracing::Span::current().record("copies", u64::from(request.copies));
         if !matches!(request.rotation, 0 | 90 | 180 | 270) {
@@ -608,9 +774,22 @@ impl JobExecutor {
             && loaded_media.as_ref().is_some_and(|media| {
                 let width = media.get("widthMm").and_then(serde_json::Value::as_f64);
                 let length = media.get("lengthMm").and_then(serde_json::Value::as_f64);
-                width.is_some_and(|width| document_width_mm > width + 0.5)
-                    || (!document.media.continuous
-                        && length.is_some_and(|length| document_height_mm > length + 0.5))
+                documents.iter().any(|item| {
+                    let (item_width, item_height) = if matches!(request.rotation, 90 | 270) {
+                        (
+                            item.media.height as f64 / 1000.0,
+                            item.media.width as f64 / 1000.0,
+                        )
+                    } else {
+                        (
+                            item.media.width as f64 / 1000.0,
+                            item.media.height as f64 / 1000.0,
+                        )
+                    };
+                    width.is_some_and(|width| item_width > width + 0.5)
+                        || (!item.media.continuous
+                            && length.is_some_and(|length| item_height > length + 0.5))
+                })
             })
         {
             return Err(ApiError(
@@ -630,14 +809,19 @@ impl JobExecutor {
                 (height * f64::from(target_dpi) / 25.4).round() as u32,
             ))
         });
-        let packed = api_render_for_printer(
-            &document,
-            &printer,
-            target_dpi,
-            request.rotation,
-            request.fit,
-            loaded_box,
-        )?;
+        let packed = documents
+            .iter()
+            .map(|item| {
+                api_render_for_printer(
+                    item,
+                    &printer,
+                    target_dpi,
+                    request.rotation,
+                    request.fit,
+                    loaded_box,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let brother_media = if printer.protocol == mb_printer_core::capabilities::Protocol::Brother
         {
             let width = loaded_media
@@ -677,17 +861,29 @@ impl JobExecutor {
         } else {
             None
         };
-        let plan = protocol::plan(
-            &printer,
-            &packed,
-            &Options {
-                density: request.density,
-                copies: request.copies,
-                continuous: document.media.continuous,
-                brother_media,
-                ..Options::default()
-            },
-        )
+        let options = Options {
+            density: request.density,
+            copies: if packed.len() == 1 { request.copies } else { 1 },
+            continuous: document.media.continuous,
+            brother_media,
+            cut,
+            cut_every,
+            ..Options::default()
+        };
+        let plan = if packed.len() == 1 {
+            protocol::plan(&printer, &packed[0], &options)
+        } else {
+            let expanded = packed
+                .iter()
+                .flat_map(|raster| std::iter::repeat_n(raster.clone(), usize::from(request.copies)))
+                .collect::<Vec<_>>();
+            protocol::plan_batch_with_limits(
+                &printer,
+                &expanded,
+                &options,
+                &mb_printer_core::limits::ProcessingLimits::default(),
+            )
+        }
         .map_err(|_| ApiError(StatusCode::UNPROCESSABLE_ENTITY, "protocol plan failed"))?;
         let mut job = Job::new();
         if let Some(id) = forced_job_id {
@@ -697,6 +893,8 @@ impl JobExecutor {
         job.idempotency_key = scoped_key;
         job.protocol = Some(format!("{:?}", printer.protocol).to_ascii_lowercase());
         job.action_count = plan.actions.len();
+        job.batch_items = documents.len();
+        job.batch_copies = request.copies;
         job.total_bytes = plan
             .actions
             .iter()
@@ -713,7 +911,7 @@ impl JobExecutor {
         tracing::Span::current().record("action_count", plan.actions.len() as u64);
         tracing::Span::current().record("total_bytes", job.total_bytes);
         job.resumable = Some(
-            serde_json::json!({"model":model,"connectionId":request.connection_id,"transport":request.transport,"document":request.document,"dpi":request.dpi,"rotation":request.rotation,"fit":request.fit,"density":request.density,"copies":request.copies,"payloadLimit":request.payload_limit}),
+            serde_json::json!({"model":model,"connectionId":request.connection_id,"transport":request.transport,"document":request.document,"documents":request.documents,"dpi":request.dpi,"rotation":request.rotation,"fit":request.fit,"density":request.density,"copies":request.copies,"payloadLimit":request.payload_limit,"continuous":request.continuous}),
         );
         let (events, _) = broadcast::channel(32);
         let cancel = Arc::new(AtomicBool::new(false));
@@ -793,91 +991,129 @@ impl JobExecutor {
                 .unwrap_or_default()
                 .as_millis();
             let _ = events.send(running.clone());
-            let execution = match transport {
-                ApiTransport::Capture => {
-                    let mut target = CaptureTransport::new(request.payload_limit);
-                    if matches!(
-                        printer.protocol,
-                        mb_printer_core::capabilities::Protocol::Brother
-                    ) {
-                        let mut response = vec![0; 32];
-                        response[..3].copy_from_slice(&[0x80, 0x20, 0x42]);
-                        target.response = Some(response);
+            let execution = {
+                let mut report = |progress: &mb_printer_native::Progress| {
+                    running.last_completed_action =
+                        progress.last_completed_action.map(|value| value as u32);
+                    running.bytes_written = progress.bytes_written;
+                    running.potentially_accepted_write = progress.potentially_accepted_write;
+                    let (item, copy) = batch_position(
+                        &plan,
+                        progress.last_completed_action,
+                        request.copies,
+                        documents.len(),
+                    );
+                    running.batch_item = item;
+                    running.batch_copy = copy;
+                    running.updated_at_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis();
+                    let _ = events.send(running.clone());
+                };
+                match transport {
+                    ApiTransport::Capture => {
+                        let mut target = CaptureTransport::new(request.payload_limit);
+                        if matches!(
+                            printer.protocol,
+                            mb_printer_core::capabilities::Protocol::Brother
+                        ) {
+                            let mut response = vec![0; 32];
+                            response[..3].copy_from_slice(&[0x80, 0x20, 0x42]);
+                            target.response = Some(response);
+                        }
+                        execute_cancellable(&plan, target, cancel.clone(), &mut report)
                     }
-                    execute_cancellable(&plan, target, cancel.clone())
-                }
-                ApiTransport::File { path } => {
-                    WriteTransport::file(std::path::Path::new(&path), request.payload_limit)
-                        .map_err(|error| (error.to_string(), None))
-                        .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
-                }
-                ApiTransport::Tcp { address } => {
-                    TcpTransport::connect(&address, request.payload_limit, Duration::from_secs(5))
-                        .map_err(|error| (error.to_string(), None))
-                        .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
-                }
-                ApiTransport::Ipp {
-                    uri,
-                    certificate_pem,
-                } => execute_ipp_cancellable(
-                    &plan,
-                    uri,
-                    certificate_pem,
-                    request.payload_limit,
-                    cancel.clone(),
-                ),
-                ApiTransport::Serial { path, baud } => {
-                    SerialTransport::open(std::path::Path::new(&path), baud, request.payload_limit)
-                        .map_err(|error| (error.to_string(), None))
-                        .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
-                }
-                #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
-                ApiTransport::Rfcomm { address, channel } => {
-                    mb_printer_native::transports::rfcomm::RfcommTransport::bind(
-                        0,
+                    ApiTransport::File { path } => {
+                        WriteTransport::file(std::path::Path::new(&path), request.payload_limit)
+                            .map_err(|error| (error.to_string(), None))
+                            .and_then(|target| {
+                                execute_cancellable(&plan, target, cancel.clone(), &mut report)
+                            })
+                    }
+                    ApiTransport::Tcp { address } => TcpTransport::connect(
                         &address,
-                        channel,
+                        request.payload_limit,
+                        Duration::from_secs(5),
+                    )
+                    .map_err(|error| (error.to_string(), None))
+                    .and_then(|target| {
+                        execute_cancellable(&plan, target, cancel.clone(), &mut report)
+                    }),
+                    ApiTransport::Ipp {
+                        uri,
+                        certificate_pem,
+                    } => execute_ipp_cancellable(
+                        &plan,
+                        uri,
+                        certificate_pem,
+                        request.payload_limit,
+                        cancel.clone(),
+                        &mut report,
+                    ),
+                    ApiTransport::Serial { path, baud } => SerialTransport::open(
+                        std::path::Path::new(&path),
+                        baud,
                         request.payload_limit,
                     )
-                    .map_err(|error| (error, None))
-                    .and_then(|target| execute_cancellable(&plan, target, cancel.clone()))
-                }
-                #[cfg(not(all(feature = "bluetooth-linux", target_os = "linux")))]
-                ApiTransport::Rfcomm { .. } => {
-                    Err(("RFCOMM support is unavailable in this build".into(), None))
-                }
-                #[cfg(feature = "usb")]
-                ApiTransport::Usb {
-                    vid,
-                    pid,
-                    interface,
-                    out,
-                    input,
-                } => crate::transport::usb::UsbTransport::open(
-                    vid,
-                    pid,
-                    interface,
-                    out,
-                    input,
-                    request.payload_limit,
-                )
-                .map_err(|error| (error.to_string(), None))
-                .and_then(|target| execute_cancellable(&plan, target, cancel.clone())),
-                #[cfg(not(feature = "usb"))]
-                ApiTransport::Usb { .. } => {
-                    Err(("USB support is unavailable in this build".into(), None))
-                }
-                #[cfg(feature = "bluetooth")]
-                ApiTransport::Ble { address } => worker_runtime
-                    .block_on(crate::transport::bluetooth::BleTransport::connect(
-                        &address,
-                        request.payload_limit,
-                    ))
                     .map_err(|error| (error.to_string(), None))
-                    .and_then(|target| execute_cancellable(&plan, target, cancel.clone())),
-                #[cfg(not(feature = "bluetooth"))]
-                ApiTransport::Ble { .. } => {
-                    Err(("BLE support is unavailable in this build".into(), None))
+                    .and_then(|target| {
+                        execute_cancellable(&plan, target, cancel.clone(), &mut report)
+                    }),
+                    #[cfg(all(feature = "bluetooth-linux", target_os = "linux"))]
+                    ApiTransport::Rfcomm { address, channel } => {
+                        mb_printer_native::transports::rfcomm::RfcommTransport::bind(
+                            0,
+                            &address,
+                            channel,
+                            request.payload_limit,
+                        )
+                        .map_err(|error| (error, None))
+                        .and_then(|target| {
+                            execute_cancellable(&plan, target, cancel.clone(), &mut report)
+                        })
+                    }
+                    #[cfg(not(all(feature = "bluetooth-linux", target_os = "linux")))]
+                    ApiTransport::Rfcomm { .. } => {
+                        Err(("RFCOMM support is unavailable in this build".into(), None))
+                    }
+                    #[cfg(feature = "usb")]
+                    ApiTransport::Usb {
+                        vid,
+                        pid,
+                        interface,
+                        out,
+                        input,
+                    } => crate::transport::usb::UsbTransport::open(
+                        vid,
+                        pid,
+                        interface,
+                        out,
+                        input,
+                        request.payload_limit,
+                    )
+                    .map_err(|error| (error.to_string(), None))
+                    .and_then(|target| {
+                        execute_cancellable(&plan, target, cancel.clone(), &mut report)
+                    }),
+                    #[cfg(not(feature = "usb"))]
+                    ApiTransport::Usb { .. } => {
+                        Err(("USB support is unavailable in this build".into(), None))
+                    }
+                    #[cfg(feature = "bluetooth")]
+                    ApiTransport::Ble { address } => worker_runtime
+                        .block_on(crate::transport::bluetooth::BleTransport::connect(
+                            &address,
+                            request.payload_limit,
+                        ))
+                        .map_err(|error| (error.to_string(), None))
+                        .and_then(|target| {
+                            execute_cancellable(&plan, target, cancel.clone(), &mut report)
+                        }),
+                    #[cfg(not(feature = "bluetooth"))]
+                    ApiTransport::Ble { .. } => {
+                        Err(("BLE support is unavailable in this build".into(), None))
+                    }
                 }
             };
             match execution {
@@ -940,6 +1176,22 @@ impl JobExecutor {
             job: accepted,
         })
     }
+}
+
+fn batch_position(
+    plan: &mb_printer_core::protocol::Plan,
+    last_action: Option<usize>,
+    copies: u16,
+    items: usize,
+) -> (usize, u16) {
+    let Some(last) = last_action else {
+        return (0, 0);
+    };
+    let divisor = usize::from(copies).max(1);
+    let page=plan.actions.iter().take(last+1).filter(|action|matches!(action,mb_printer_core::protocol::Action::CommandWrite{name,..} if name=="ESC i z print information")).count().saturating_sub(1);
+    let item = (page / divisor).min(items.saturating_sub(1));
+    let copy = u16::try_from(page % divisor).unwrap_or(0);
+    (item, copy)
 }
 
 fn job_state_name(state: JobState) -> &'static str {
@@ -1043,4 +1295,154 @@ pub(super) async fn job_events(
             .expect("job serialization cannot fail"))
     });
     Ok(Sse::new(stream))
+}
+
+#[cfg(test)]
+mod continuous_tests {
+    use super::*;
+    use crate::cloud::store::{ContinuousCutMode, ContinuousPrintOptions};
+
+    const CONTINUOUS_DOCUMENT: &str = r#"{
+      "version": 4,
+      "name": "continuous",
+      "media": {
+        "width": 50000,
+        "height": 30000,
+        "unit": "micrometre",
+        "dpi": 300,
+        "orientation": "portrait",
+        "printableBounds": { "x": 0, "y": 0, "width": 50000, "height": 30000 },
+        "shape": "rectangle",
+        "continuous": true
+      },
+      "coordinateSystem": {
+        "unit": "micrometre",
+        "origin": "top-left",
+        "rounding": "half-away-from-zero"
+      },
+      "elements": [],
+      "resources": [],
+      "fields": [],
+      "extensions": {}
+    }"#;
+
+    fn options(cut_mode: ContinuousCutMode) -> ContinuousPrintOptions {
+        ContinuousPrintOptions {
+            cut_mode,
+            extra_feed_before_mm: 0.0,
+            extra_feed_after_mm: 0.0,
+            chain_copies: false,
+        }
+    }
+
+    #[test]
+    fn qualified_continuous_options_map_to_protocol_cut_controls() {
+        let document = Document::from_json(CONTINUOUS_DOCUMENT).unwrap();
+        let printer = capabilities::by_id("ql-1110nwb").unwrap();
+
+        assert_eq!(
+            continuous_protocol_options(
+                &document,
+                &printer,
+                Some(&options(ContinuousCutMode::AfterEach)),
+                2,
+            )
+            .unwrap(),
+            (true, 1)
+        );
+        assert_eq!(
+            continuous_protocol_options(
+                &document,
+                &printer,
+                Some(&options(ContinuousCutMode::None)),
+                2,
+            )
+            .unwrap(),
+            (false, 1)
+        );
+    }
+
+    #[test]
+    fn after_job_maps_to_batch_counter_and_unsupported_feed_is_rejected() {
+        let document = Document::from_json(CONTINUOUS_DOCUMENT).unwrap();
+        let printer = capabilities::by_id("ql-1110nwb").unwrap();
+
+        let after_job = continuous_protocol_options(
+            &document,
+            &printer,
+            Some(&options(ContinuousCutMode::AfterJob)),
+            2,
+        )
+        .unwrap();
+        assert_eq!(after_job, (true, 2));
+
+        let mut feed = options(ContinuousCutMode::AfterEach);
+        feed.extra_feed_after_mm = 1.0;
+        let feed = continuous_protocol_options(&document, &printer, Some(&feed), 1).unwrap_err();
+        assert_eq!(feed.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn continuous_media_is_validated_when_print_options_are_omitted() {
+        let document = Document::from_json(CONTINUOUS_DOCUMENT).unwrap();
+        let qualified = capabilities::by_id("ql-1110nwb").unwrap();
+        let unsupported = capabilities::by_id("m200").unwrap();
+
+        assert_eq!(
+            continuous_protocol_options(&document, &qualified, None, 1).unwrap(),
+            (true, 1)
+        );
+        let unsupported =
+            continuous_protocol_options(&document, &unsupported, None, 1).unwrap_err();
+        assert_eq!(unsupported.0, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn ordinary_media_without_continuous_options_keeps_default_cut_behavior() {
+        let document = Document::from_json(
+            &CONTINUOUS_DOCUMENT.replace("\"continuous\": true", "\"continuous\": false"),
+        )
+        .unwrap();
+        let printer = capabilities::by_id("m200").unwrap();
+
+        assert_eq!(
+            continuous_protocol_options(&document, &printer, None, 1).unwrap(),
+            (true, 1)
+        );
+    }
+
+    #[test]
+    fn batch_progress_maps_each_document_and_copy_from_plan_actions() {
+        use mb_printer_core::{
+            capabilities::Protocol,
+            protocol::{Action, Plan},
+        };
+
+        let page = || {
+            vec![
+                Action::CommandWrite {
+                    name: "ESC i z print information".into(),
+                    bytes: vec![0x1b, 0x69, 0x7a],
+                    atomic: true,
+                },
+                Action::RasterWrite {
+                    bytes: vec![0],
+                    logical_chunk: 0,
+                    delay_after_each_physical_write_ms: 0,
+                },
+            ]
+        };
+        let plan = Plan {
+            protocol: Protocol::Brother,
+            source_commit: "test".into(),
+            actions: (0..4).flat_map(|_| page()).collect(),
+        };
+
+        assert_eq!(batch_position(&plan, None, 2, 2), (0, 0));
+        assert_eq!(batch_position(&plan, Some(0), 2, 2), (0, 0));
+        assert_eq!(batch_position(&plan, Some(2), 2, 2), (0, 1));
+        assert_eq!(batch_position(&plan, Some(4), 2, 2), (1, 0));
+        assert_eq!(batch_position(&plan, Some(6), 2, 2), (1, 1));
+        assert_eq!(batch_position(&plan, Some(7), 2, 2), (1, 1));
+    }
 }

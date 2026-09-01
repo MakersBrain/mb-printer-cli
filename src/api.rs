@@ -579,7 +579,7 @@ async fn capabilities(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     authorize(&state, &headers).await?;
     Ok(Json(
-        serde_json::json!({"service":"mb-printer","version":VERSION,"api":"v1","features":["documents","preview-png","jobs","job-idempotency","job-fit","self-service-grants","dual-stack-loopback","assets","laposte","file-transport","tcp-transport","serial-transport","ipp-transport","ipps-transport"],"max_document_bytes":state.config.max_document_bytes,"printer_definition_count":capabilities::bundled().len()}),
+        serde_json::json!({"service":"mb-printer","version":VERSION,"api":"v1","features":["documents","preview-png","jobs","job-idempotency","job-fit","continuous-options","native-document-batch","self-service-grants","dual-stack-loopback","assets","laposte","file-transport","tcp-transport","serial-transport","ipp-transport","ipps-transport"],"max_document_bytes":state.config.max_document_bytes,"printer_definition_count":capabilities::bundled().len()}),
     ))
 }
 async fn printers(State(state): State<ApiState>, headers: HeaderMap) -> Result<Response, ApiError> {
@@ -2451,7 +2451,8 @@ mod tests {
         let fixture: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/editor-job.json")).unwrap();
         let request = crate::cloud::store::CloudPrintRequest {
-            document: fixture["document"].clone(),
+            document: Some(fixture["document"].clone()),
+            documents: Vec::new(),
             model: "m110".into(),
             dpi: None,
             rotation: 0,
@@ -2459,6 +2460,7 @@ mod tests {
             density: 6,
             copies: 1,
             payload_limit: 512,
+            continuous: None,
         };
         let id = Uuid::new_v4();
         state
@@ -3541,8 +3543,13 @@ mod tests {
                 atomic: true,
             }],
         };
-        let error = execute_cancellable(&plan, FailFirstWrite, Arc::new(AtomicBool::new(false)))
-            .unwrap_err();
+        let error = execute_cancellable(
+            &plan,
+            FailFirstWrite,
+            Arc::new(AtomicBool::new(false)),
+            &mut |_| {},
+        )
+        .unwrap_err();
         let progress = error.1.unwrap();
         assert!(progress.potentially_accepted_write);
         assert_eq!(progress.bytes_written, 0);
